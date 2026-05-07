@@ -428,6 +428,35 @@ complementary_info.acp_indicator_<TAG>
 
 These columns are written back to the original dataset specified by `--dataset.repo_id`.
 
+Optional stage-aware chunk mining:
+
+```bash
+lerobot-stage-chunk-mine \
+  --dataset.repo_id=<HF_USERNAME_OR_ORG>/<DATASET_NAME> \
+  --mining.value_field=complementary_info.value_<TAG> \
+  --mining.output_prefix=complementary_info.vgsacm_<TAG> \
+  --mining.value_normalization=clip \
+  --mining.num_stages=5 \
+  --mining.chunk_size=50 \
+  --mining.stage_top_ratio=0.3 \
+  --mining.boundary_top_k=1
+```
+
+This reuses the value column from `lerobot-value-infer`, partitions each episode into value stages,
+mines high-advantage intra-stage chunks plus boundary-transition chunks, and writes a new binary
+indicator for policy post-training:
+
+```bash
+complementary_info.vgsacm_<TAG>.normalized_value
+complementary_info.vgsacm_<TAG>.completion
+complementary_info.vgsacm_<TAG>.stage
+complementary_info.vgsacm_<TAG>.chunk_advantage
+complementary_info.vgsacm_<TAG>.indicator
+```
+
+Use `--mining.value_normalization=episode_minmax` when the value source is not already calibrated to
+Pi\*0.6-style `[-1, 0]` values.
+
 <a id="policy-training"></a>
 
 ### 6) Policy Training
@@ -447,7 +476,7 @@ lerobot-train \
   --batch_size=32 \
   --steps=30000 \
   --acp.enable=true \
-  --acp.indicator_field=complementary_info.acp_indicator_<TAG> \
+  --acp.indicator_field=complementary_info.vgsacm_<TAG>.indicator \
   --acp.indicator_dropout_prob=0.3 \
   --output_dir=outputs/train/<RUN_NAME> \
   --job_name=<RUN_NAME> \
