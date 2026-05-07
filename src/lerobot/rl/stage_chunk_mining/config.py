@@ -36,6 +36,7 @@ class StageChunkMiningConfig:
 
     boundary_top_k: int = 1
     boundary_nms_iou: float = 0.5
+    boundary_mode: str = "unique_stage_boundary"
     value_smoothing_window: int = 1
 
     l_max_mode: str = "task_p95"
@@ -67,6 +68,12 @@ class StageChunkMiningConfig:
             raise ValueError("'mining.boundary_top_k' must be >= 0.")
         if not 0.0 <= self.boundary_nms_iou <= 1.0:
             raise ValueError("'mining.boundary_nms_iou' must be within [0, 1].")
+        valid_boundary_modes = {"unique_stage_boundary", "forward_crossing"}
+        if self.boundary_mode not in valid_boundary_modes:
+            raise ValueError(
+                f"'mining.boundary_mode' must be one of {sorted(valid_boundary_modes)}, "
+                f"got {self.boundary_mode!r}."
+            )
         if self.value_smoothing_window <= 0:
             raise ValueError("'mining.value_smoothing_window' must be > 0.")
         valid_l_max_modes = {"task_p95", "task_max", "global_p95", "global_max", "task_success_max"}

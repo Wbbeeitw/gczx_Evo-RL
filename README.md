@@ -438,8 +438,10 @@ lerobot-stage-chunk-mine \
   --mining.value_normalization=clip \
   --mining.num_stages=5 \
   --mining.chunk_size=50 \
-  --mining.stage_top_ratio=0.3 \
-  --mining.boundary_top_k=1
+  --mining.stage_top_ratio=0.1 \
+  --mining.boundary_top_k=1 \
+  --mining.boundary_mode=unique_stage_boundary \
+  --mining.value_smoothing_window=15
 ```
 
 This reuses the value column from `lerobot-value-infer`, partitions each episode into value stages,
@@ -455,7 +457,10 @@ complementary_info.vgsacm_<TAG>.indicator
 ```
 
 Use `--mining.value_normalization=episode_minmax` when the value source is not already calibrated to
-Pi\*0.6-style `[-1, 0]` values.
+Pi\*0.6-style `[-1, 0]` values. The default boundary mode, `unique_stage_boundary`, keeps at most
+`boundary_top_k` chunks for each newly reached stage boundary in an episode, avoiding repeated selections
+when framewise values jitter around the same stage threshold. Use `--mining.boundary_mode=forward_crossing`
+only for legacy comparisons against every local upward stage crossing.
 
 <a id="policy-training"></a>
 

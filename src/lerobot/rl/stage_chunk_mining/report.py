@@ -62,9 +62,9 @@ def format_report_summary(report: dict[str, Any]) -> str:
         f"- selected_ratio: {float(report.get('selected_ratio', 0.0)):.6f}",
         f"- intra_candidates: {report.get('intra_candidates', 0)}",
         f"- intra_selected: {report.get('intra_selected', 0)}",
+        f"- boundary_mode: {report.get('boundary_mode', 'unknown')}",
         f"- boundary_count: {report.get('boundary_count', 0)}",
         f"- boundary_candidates: {report.get('boundary_candidates', 0)}",
         f"- boundary_selected: {report.get('boundary_selected', 0)}",
     ]
     return "\n".join(lines)
-

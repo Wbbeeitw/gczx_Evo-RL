@@ -147,6 +147,7 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
         min_stage_candidates=cfg.mining.min_stage_candidates,
         boundary_top_k=cfg.mining.boundary_top_k,
         boundary_nms_iou=cfg.mining.boundary_nms_iou,
+        boundary_mode=cfg.mining.boundary_mode,
         value_smoothing_window=cfg.mining.value_smoothing_window,
         value_normalization=cfg.mining.value_normalization,
         include_intra_stage=cfg.mining.include_intra_stage,
@@ -172,6 +173,7 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
     report["l_max_by_task"] = {str(k): float(v) for k, v in l_max_by_task.items()}
     report["value_field"] = cfg.mining.value_field
     report["value_normalization"] = cfg.mining.value_normalization
+    report["boundary_mode"] = cfg.mining.boundary_mode
     report["output_prefix"] = cfg.mining.output_prefix
     report["indicator_field"] = f"{cfg.mining.output_prefix}.indicator"
 

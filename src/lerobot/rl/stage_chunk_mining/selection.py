@@ -9,7 +9,11 @@ from math import ceil
 import numpy as np
 
 from lerobot.rl.stage_chunk_mining.advantage import compute_chunk_advantage, safe_l_max
-from lerobot.rl.stage_chunk_mining.boundary import boundary_candidate_starts, find_forward_boundaries
+from lerobot.rl.stage_chunk_mining.boundary import (
+    boundary_candidate_starts,
+    find_forward_boundaries,
+    find_unique_stage_boundaries,
+)
 from lerobot.rl.stage_chunk_mining.chunks import iter_episode_slices, valid_chunk_start_count
 from lerobot.rl.stage_chunk_mining.nms import temporal_nms
 from lerobot.rl.stage_chunk_mining.stages import normalize_values, smooth_values, values_to_stages
@@ -115,6 +119,7 @@ def mine_stage_chunks(
     min_stage_candidates: int = 1,
     boundary_top_k: int = 1,
     boundary_nms_iou: float = 0.5,
+    boundary_mode: str = "unique_stage_boundary",
     value_smoothing_window: int = 1,
     value_normalization: str = "clip",
     include_intra_stage: bool = True,
@@ -141,6 +146,12 @@ def mine_stage_chunks(
     intra_candidates: dict[tuple[int, int], list[tuple[int, float]]] = defaultdict(list)
     boundary_count = 0
     boundary_candidate_count = 0
+
+    if boundary_mode not in {"unique_stage_boundary", "forward_crossing"}:
+        raise ValueError(
+            "'boundary_mode' must be one of ['forward_crossing', 'unique_stage_boundary'], "
+            f"got {boundary_mode!r}."
+        )
 
     for _episode_id, ep_slice in iter_episode_slices(episode_indices):
         _validate_episode_slice(frame_indices=frame_indices, task_indices=task_indices, ep_slice=ep_slice)
@@ -188,7 +199,10 @@ def mine_stage_chunks(
             local_chunk_type[local_t] = ctype
 
         if include_boundary and boundary_top_k > 0:
-            boundaries = find_forward_boundaries(ep_stage)
+            if boundary_mode == "forward_crossing":
+                boundaries = find_forward_boundaries(ep_stage)
+            else:
+                boundaries = find_unique_stage_boundaries(ep_stage)
             for local_boundary in boundaries:
                 boundary_count += 1
                 starts = boundary_candidate_starts(
@@ -255,6 +269,7 @@ def mine_stage_chunks(
         "boundary_count": int(boundary_count),
         "boundary_candidates": int(boundary_candidate_count),
         "boundary_selected": int(np.sum(selection_role == SELECTION_BOUNDARY_TRANSITION)),
+        "boundary_mode": boundary_mode,
     }
     return StageChunkMiningResult(
         normalized_value=normalized_value,
