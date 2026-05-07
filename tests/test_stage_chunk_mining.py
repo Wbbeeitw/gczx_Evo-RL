@@ -46,6 +46,91 @@ class TestStageChunkMining(unittest.TestCase):
         self.assertGreater(int(np.sum(result.selection_role == SELECTION_INTRA_STAGE_TOP)), 0)
         self.assertEqual(int(np.sum(result.indicator)), int(np.sum(result.selection_role == SELECTION_INTRA_STAGE_TOP)))
 
+    def test_success_episode_uses_episode_minmax_monotonic_stages(self):
+        values = np.asarray([100.0, 125.0, 150.0, 175.0, 200.0], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            episode_success={0: True},
+            num_stages=5,
+            chunk_size=1,
+            include_intra_stage=False,
+            include_boundary=False,
+        )
+        np.testing.assert_array_equal(result.stage, np.asarray([0, 1, 2, 3, 4], dtype=np.int64))
+        self.assertEqual(result.report["success_episodes"], 1)
+        self.assertEqual(result.report["failure_episodes"], 0)
+
+    def test_success_episode_suppresses_stage_jitter(self):
+        values = np.asarray([0.0, 2.0, 1.0, 4.0, 3.0], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            episode_success={0: True},
+            num_stages=5,
+            chunk_size=1,
+            include_intra_stage=False,
+            include_boundary=False,
+        )
+        self.assertTrue(bool(np.all(np.diff(result.stage) >= 0)))
+        self.assertEqual(int(result.stage[0]), 0)
+        self.assertEqual(int(result.stage[-1]), 4)
+
+    def test_failed_episode_only_mines_before_first_stage_descent(self):
+        values = np.asarray(
+            [-0.95, -0.95, -0.75, -0.75, -0.55, -0.55, -0.75, -0.75, -0.95, -0.95],
+            dtype=np.float32,
+        )
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            episode_success={0: False},
+            num_stages=5,
+            chunk_size=1,
+            value_normalization="clip",
+            stage_top_ratio=1.0,
+            boundary_top_k=0,
+            failure_max_stage=2,
+            include_intra_stage=True,
+            include_boundary=False,
+        )
+        selected_starts = set(int(v) for v in np.flatnonzero(result.selection_role == SELECTION_INTRA_STAGE_TOP))
+        self.assertEqual(selected_starts, {0, 2, 4})
+        self.assertEqual(result.report["failure_episodes"], 1)
+
+    def test_failed_episode_boundary_selection_stops_before_descent(self):
+        values = np.asarray([-0.95, -0.75, -0.55, -0.55, -0.75, -0.95], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            episode_success={0: False},
+            num_stages=5,
+            chunk_size=2,
+            value_normalization="clip",
+            stage_top_ratio=0.0,
+            boundary_top_k=1,
+            boundary_mode="unique_stage_boundary",
+            failure_max_stage=2,
+            include_intra_stage=False,
+            include_boundary=True,
+        )
+        selected_starts = set(int(v) for v in np.flatnonzero(result.selection_role == SELECTION_BOUNDARY_TRANSITION))
+        self.assertEqual(selected_starts, {0, 1})
+        self.assertEqual(result.report["boundary_count"], 2)
+        self.assertEqual(result.report["boundary_selected"], 2)
+
     def test_boundary_top_one_selects_best_transition_chunk(self):
         values = np.asarray([-0.7, -0.61, -0.59, -0.3], dtype=np.float32)
         result = mine_stage_chunks(

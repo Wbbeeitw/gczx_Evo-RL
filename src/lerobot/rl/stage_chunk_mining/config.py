@@ -8,6 +8,8 @@ from typing import Any
 
 import draccus
 
+from lerobot.utils.recording_annotations import normalize_episode_success_label
+
 
 @dataclass
 class StageChunkDatasetConfig:
@@ -16,17 +18,25 @@ class StageChunkDatasetConfig:
     episodes: list[int] | None = None
     revision: str | None = None
     download_videos: bool = False
+    success_field: str = "episode_success"
+    default_success: str = "success"
 
     def validate(self) -> None:
         if not self.repo_id:
             raise ValueError("'dataset.repo_id' must be non-empty.")
+        if not self.success_field:
+            raise ValueError("'dataset.success_field' must be non-empty.")
+        normalized = normalize_episode_success_label(self.default_success)
+        if normalized is None:
+            raise ValueError("'dataset.default_success' must be either 'success' or 'failure'.")
+        self.default_success = normalized
 
 
 @dataclass
 class StageChunkMiningConfig:
     value_field: str = "complementary_info.value"
     output_prefix: str = "complementary_info.vgsacm"
-    value_normalization: str = "clip"
+    value_normalization: str = "episode_minmax"
 
     num_stages: int = 5
     chunk_size: int = 50
@@ -38,6 +48,7 @@ class StageChunkMiningConfig:
     boundary_nms_iou: float = 0.5
     boundary_mode: str = "unique_stage_boundary"
     value_smoothing_window: int = 1
+    failure_max_stage: int = 2
 
     l_max_mode: str = "task_p95"
     include_intra_stage: bool = True
@@ -76,6 +87,10 @@ class StageChunkMiningConfig:
             )
         if self.value_smoothing_window <= 0:
             raise ValueError("'mining.value_smoothing_window' must be > 0.")
+        if self.failure_max_stage < 0:
+            raise ValueError("'mining.failure_max_stage' must be >= 0.")
+        if self.failure_max_stage >= self.num_stages:
+            raise ValueError("'mining.failure_max_stage' must be smaller than 'mining.num_stages'.")
         valid_l_max_modes = {"task_p95", "task_max", "global_p95", "global_max", "task_success_max"}
         if self.l_max_mode not in valid_l_max_modes:
             raise ValueError(

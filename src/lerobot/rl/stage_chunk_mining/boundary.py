@@ -41,6 +41,30 @@ def find_unique_stage_boundaries(stages: np.ndarray) -> np.ndarray:
     return np.asarray(boundaries, dtype=np.int64)
 
 
+def find_unique_stage_boundary_events(stages: np.ndarray, max_stage: int | None = None) -> list[tuple[int, int]]:
+    """Return ``(target_stage, boundary_index)`` once for each newly reached stage."""
+
+    stages = np.asarray(stages, dtype=np.int64)
+    if stages.ndim != 1:
+        raise ValueError(f"'stages' must be rank-1, got shape={tuple(stages.shape)}.")
+    if stages.size <= 1:
+        return []
+
+    events: list[tuple[int, int]] = []
+    running_max = int(stages[0])
+    for idx in range(1, stages.size):
+        stage = int(stages[idx])
+        if stage <= running_max:
+            continue
+
+        target_high = stage if max_stage is None else min(stage, int(max_stage))
+        for target_stage in range(running_max + 1, target_high + 1):
+            events.append((target_stage, idx))
+        running_max = stage
+
+    return events
+
+
 def boundary_candidate_starts(
     boundary_index: int,
     episode_length: int,

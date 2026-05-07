@@ -20,6 +20,7 @@ from lerobot.rl.stage_chunk_mining.annotation_io import (
 from lerobot.rl.stage_chunk_mining.config import StageChunkMinePipelineConfig
 from lerobot.rl.stage_chunk_mining.report import build_selection_report, format_report_summary, save_report
 from lerobot.rl.stage_chunk_mining.selection import mine_stage_chunks
+from lerobot.utils.recording_annotations import EPISODE_SUCCESS, resolve_episode_success_label
 
 
 def _episode_lengths_by_task(
@@ -42,29 +43,44 @@ def _episode_lengths_by_task(
     return lengths_by_task
 
 
-def _success_episode_indices(dataset: LeRobotDataset) -> set[int]:
+def _episode_success_by_index(
+    dataset: LeRobotDataset,
+    *,
+    success_field: str,
+    default_success: str,
+) -> dict[int, bool]:
     episodes = dataset.meta.episodes.with_format(None)
-    if "episode_success" not in episodes.column_names:
-        return set()
     payload = episodes[:]
-    success_eps: set[int] = set()
-    for ep_idx, label in zip(payload["episode_index"], payload["episode_success"], strict=True):
-        if str(label).strip().lower() == "success":
-            success_eps.add(int(ep_idx))
-    return success_eps
+    has_success = success_field in episodes.column_names
+
+    success_by_index: dict[int, bool] = {}
+    for i in range(len(episodes)):
+        ep_idx = int(payload["episode_index"][i])
+        explicit_success = payload[success_field][i] if has_success else None
+        resolved_success = resolve_episode_success_label(
+            explicit_success,
+            default_label=default_success,
+            require_label=True,
+        )
+        success_by_index[ep_idx] = resolved_success == EPISODE_SUCCESS
+    return success_by_index
+
+
+def _success_episode_indices(episode_success: dict[int, bool]) -> set[int]:
+    return {int(ep_idx) for ep_idx, success in episode_success.items() if success}
 
 
 def _compute_l_max_by_task(
     *,
-    dataset: LeRobotDataset,
     episode_indices: np.ndarray,
     task_indices: np.ndarray,
     mode: str,
     chunk_size: int,
+    episode_success: dict[int, bool],
 ) -> dict[int, float]:
     lengths_by_task = _episode_lengths_by_task(episode_indices, task_indices)
     if mode == "task_success_max":
-        success_eps = _success_episode_indices(dataset)
+        success_eps = _success_episode_indices(episode_success)
         if success_eps:
             success_lengths_by_task: dict[int, list[int]] = defaultdict(list)
             start = 0
@@ -82,7 +98,7 @@ def _compute_l_max_by_task(
             }
         else:
             logging.warning(
-                "No episode_success metadata found for l_max_mode=task_success_max; falling back to task_p95."
+                "No successful episodes resolved for l_max_mode=task_success_max; falling back to task_p95."
             )
             mode = "task_p95"
 
@@ -125,12 +141,18 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
     task_indices = column_to_1d_array(raw_frames["task_index"], np.int64)
     values = column_to_1d_array(raw_frames[cfg.mining.value_field], np.float32)
 
+    episode_success = _episode_success_by_index(
+        dataset,
+        success_field=cfg.dataset.success_field,
+        default_success=cfg.dataset.default_success,
+    )
+
     l_max_by_task = _compute_l_max_by_task(
-        dataset=dataset,
         episode_indices=episode_indices,
         task_indices=task_indices,
         mode=cfg.mining.l_max_mode,
         chunk_size=cfg.mining.chunk_size,
+        episode_success=episode_success,
     )
     logging.info("Computed L_max by task: %s", l_max_by_task)
 
@@ -140,6 +162,7 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
         frame_indices=frame_indices,
         task_indices=task_indices,
         l_max_by_task=l_max_by_task,
+        episode_success=episode_success,
         num_stages=cfg.mining.num_stages,
         chunk_size=cfg.mining.chunk_size,
         stage_top_ratio=cfg.mining.stage_top_ratio,
@@ -150,6 +173,7 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
         boundary_mode=cfg.mining.boundary_mode,
         value_smoothing_window=cfg.mining.value_smoothing_window,
         value_normalization=cfg.mining.value_normalization,
+        failure_max_stage=cfg.mining.failure_max_stage,
         include_intra_stage=cfg.mining.include_intra_stage,
         include_boundary=cfg.mining.include_boundary,
     )
@@ -174,6 +198,9 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
     report["value_field"] = cfg.mining.value_field
     report["value_normalization"] = cfg.mining.value_normalization
     report["boundary_mode"] = cfg.mining.boundary_mode
+    report["success_field"] = cfg.dataset.success_field
+    report["default_success"] = cfg.dataset.default_success
+    report["failure_max_stage"] = cfg.mining.failure_max_stage
     report["output_prefix"] = cfg.mining.output_prefix
     report["indicator_field"] = f"{cfg.mining.output_prefix}.indicator"
 

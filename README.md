@@ -433,20 +433,27 @@ Optional stage-aware chunk mining:
 ```bash
 lerobot-stage-chunk-mine \
   --dataset.repo_id=<HF_USERNAME_OR_ORG>/<DATASET_NAME> \
+  --dataset.success_field=episode_success \
+  --dataset.default_success=success \
   --mining.value_field=complementary_info.value_<TAG> \
   --mining.output_prefix=complementary_info.vgsacm_<TAG> \
-  --mining.value_normalization=clip \
+  --mining.value_normalization=episode_minmax \
   --mining.num_stages=5 \
   --mining.chunk_size=50 \
-  --mining.stage_top_ratio=0.1 \
+  --mining.stage_top_ratio=0.2 \
   --mining.boundary_top_k=1 \
   --mining.boundary_mode=unique_stage_boundary \
-  --mining.value_smoothing_window=15
+  --mining.value_smoothing_window=15 \
+  --mining.failure_max_stage=2
 ```
 
-This reuses the value column from `lerobot-value-infer`, partitions each episode into value stages,
-mines high-advantage intra-stage chunks plus boundary-transition chunks, and writes a new binary
-indicator for policy post-training:
+This reuses the value column from `lerobot-value-infer` and applies success-aware stage-aware chunk
+mining. Successful episodes use the monotonic envelope of per-episode value stages, then keep the
+top chunks inside each stage and at most `boundary_top_k` NMS-filtered chunks for each newly reached
+stage boundary. Failed episodes keep their rise/fall stage shape and only mine the rising prefix
+before the first stage descent, capped by `--mining.failure_max_stage`.
+
+The output is a binary indicator for policy post-training:
 
 ```bash
 complementary_info.vgsacm_<TAG>.normalized_value
@@ -456,11 +463,13 @@ complementary_info.vgsacm_<TAG>.chunk_advantage
 complementary_info.vgsacm_<TAG>.indicator
 ```
 
-Use `--mining.value_normalization=episode_minmax` when the value source is not already calibrated to
-Pi\*0.6-style `[-1, 0]` values. The default boundary mode, `unique_stage_boundary`, keeps at most
-`boundary_top_k` chunks for each newly reached stage boundary in an episode, avoiding repeated selections
-when framewise values jitter around the same stage threshold. Use `--mining.boundary_mode=forward_crossing`
-only for legacy comparisons against every local upward stage crossing.
+Use `--mining.value_normalization=clip` when the value source is already calibrated to Pi\*0.6-style
+`[-1, 0]` values and you want absolute value thresholds. The default `episode_minmax` mode builds
+stage thresholds from each episode's own value range. The default boundary mode,
+`unique_stage_boundary`, keeps at most `boundary_top_k` chunks for each newly reached stage boundary
+in an episode, avoiding repeated selections when framewise values jitter around the same stage
+threshold. Use `--mining.boundary_mode=forward_crossing` only for legacy comparisons against every
+local upward stage crossing.
 
 <a id="policy-training"></a>
 

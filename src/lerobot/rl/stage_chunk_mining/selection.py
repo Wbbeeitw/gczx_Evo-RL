@@ -12,7 +12,7 @@ from lerobot.rl.stage_chunk_mining.advantage import compute_chunk_advantage, saf
 from lerobot.rl.stage_chunk_mining.boundary import (
     boundary_candidate_starts,
     find_forward_boundaries,
-    find_unique_stage_boundaries,
+    find_unique_stage_boundary_events,
 )
 from lerobot.rl.stage_chunk_mining.chunks import iter_episode_slices, valid_chunk_start_count
 from lerobot.rl.stage_chunk_mining.nms import temporal_nms
@@ -105,6 +105,41 @@ def _stage_keep_count(num_candidates: int, stage_top_ratio: float, stage_top_k: 
     return min(num_candidates, max(min_candidates, int(ceil(num_candidates * stage_top_ratio))))
 
 
+def _episode_success_value(episode_success: dict[int, bool] | np.ndarray | None, episode_id: int) -> bool:
+    if episode_success is None:
+        return True
+    if isinstance(episode_success, dict):
+        return bool(episode_success.get(int(episode_id), True))
+    success_array = np.asarray(episode_success)
+    if episode_id < 0 or episode_id >= success_array.shape[0]:
+        return True
+    return bool(success_array[int(episode_id)])
+
+
+def _first_descent_index(stages: np.ndarray) -> int:
+    if stages.size <= 1:
+        return int(stages.size)
+    running_max = int(stages[0])
+    for idx in range(1, stages.size):
+        stage = int(stages[idx])
+        if stage < running_max:
+            return idx
+        if stage > running_max:
+            running_max = stage
+    return int(stages.size)
+
+
+def _window_chunk_type(stages: np.ndarray) -> int:
+    if stages.size == 0:
+        return CHUNK_TYPE_INVALID
+    diffs = np.diff(stages)
+    if not np.any(diffs != 0):
+        return CHUNK_TYPE_INTRA_STAGE
+    if np.any(diffs < 0):
+        return CHUNK_TYPE_REGRESSION
+    return CHUNK_TYPE_FORWARD_TRANSITION
+
+
 def mine_stage_chunks(
     *,
     values: np.ndarray,
@@ -112,6 +147,7 @@ def mine_stage_chunks(
     frame_indices: np.ndarray,
     task_indices: np.ndarray,
     l_max_by_task: dict[int, float],
+    episode_success: dict[int, bool] | np.ndarray | None = None,
     num_stages: int = 5,
     chunk_size: int = 50,
     stage_top_ratio: float = 0.3,
@@ -121,7 +157,8 @@ def mine_stage_chunks(
     boundary_nms_iou: float = 0.5,
     boundary_mode: str = "unique_stage_boundary",
     value_smoothing_window: int = 1,
-    value_normalization: str = "clip",
+    value_normalization: str = "episode_minmax",
+    failure_max_stage: int = 2,
     include_intra_stage: bool = True,
     include_boundary: bool = True,
 ) -> StageChunkMiningResult:
@@ -143,22 +180,41 @@ def mine_stage_chunks(
     weight = np.zeros(total, dtype=np.float32)
     selection_role = np.zeros(total, dtype=np.int64)
 
-    intra_candidates: dict[tuple[int, int], list[tuple[int, float]]] = defaultdict(list)
+    intra_candidates: dict[tuple[int, int, int], list[tuple[int, float]]] = defaultdict(list)
     boundary_count = 0
     boundary_candidate_count = 0
+    success_episode_count = 0
+    failure_episode_count = 0
 
     if boundary_mode not in {"unique_stage_boundary", "forward_crossing"}:
         raise ValueError(
             "'boundary_mode' must be one of ['forward_crossing', 'unique_stage_boundary'], "
             f"got {boundary_mode!r}."
         )
+    if failure_max_stage < 0 or failure_max_stage >= num_stages:
+        raise ValueError("'failure_max_stage' must be within [0, num_stages).")
 
-    for _episode_id, ep_slice in iter_episode_slices(episode_indices):
+    for episode_id, ep_slice in iter_episode_slices(episode_indices):
         _validate_episode_slice(frame_indices=frame_indices, task_indices=task_indices, ep_slice=ep_slice)
+        ep_success = _episode_success_value(episode_success, episode_id)
+        if ep_success:
+            success_episode_count += 1
+        else:
+            failure_episode_count += 1
+
         positions = np.arange(total, dtype=np.int64)[ep_slice]
         ep_values = normalize_values(values[positions], value_normalization)
         ep_values = smooth_values(ep_values, value_smoothing_window)
         ep_completion, ep_stage = values_to_stages(ep_values, num_stages)
+
+        # Successful demonstrations represent monotonic task progress. We keep
+        # only the first arrival at each higher stage so threshold jitter cannot
+        # create repeated semantic boundaries. Failed trajectories keep their
+        # raw stage shape, e.g. 0->1->2->1->0, so the first descent can cut off
+        # later non-advantage behavior.
+        if ep_success:
+            ep_stage = np.maximum.accumulate(ep_stage)
+
         normalized_value[positions] = ep_values
         completion[positions] = ep_completion
         stage[positions] = ep_stage
@@ -170,6 +226,7 @@ def mine_stage_chunks(
 
         local_advantages = np.full(episode_length, np.nan, dtype=np.float32)
         local_chunk_type = np.zeros(episode_length, dtype=np.int64)
+        failure_prefix_end = episode_length if ep_success else _first_descent_index(ep_stage)
 
         for local_t in range(num_starts):
             start_pos = int(positions[local_t])
@@ -183,14 +240,21 @@ def mine_stage_chunks(
                 chunk_size=chunk_size,
                 l_max=l_max,
             )
-            delta_stage = int(ep_stage[local_t + chunk_size] - ep_stage[local_t])
-            if delta_stage == 0:
+            stage_window = ep_stage[local_t : local_t + chunk_size + 1]
+            ctype = _window_chunk_type(stage_window)
+
+            allowed_failure_window = True
+            if not ep_success:
+                allowed_failure_window = (
+                    local_t + chunk_size < failure_prefix_end
+                    and int(np.max(stage_window)) <= failure_max_stage
+                )
+                if not allowed_failure_window:
+                    ctype = CHUNK_TYPE_INVALID
+
+            if ctype == CHUNK_TYPE_INTRA_STAGE:
                 ctype = CHUNK_TYPE_INTRA_STAGE
-                intra_candidates[(task_idx, int(ep_stage[local_t]))].append((start_pos, adv))
-            elif delta_stage > 0:
-                ctype = CHUNK_TYPE_FORWARD_TRANSITION
-            else:
-                ctype = CHUNK_TYPE_REGRESSION
+                intra_candidates[(int(episode_id), task_idx, int(ep_stage[local_t]))].append((start_pos, adv))
 
             chunk_advantage[start_pos] = np.float32(adv)
             chunk_type[start_pos] = ctype
@@ -199,11 +263,24 @@ def mine_stage_chunks(
             local_chunk_type[local_t] = ctype
 
         if include_boundary and boundary_top_k > 0:
-            if boundary_mode == "forward_crossing":
-                boundaries = find_forward_boundaries(ep_stage)
+            boundary_events: list[tuple[int, int]]
+            if ep_success:
+                if boundary_mode == "forward_crossing":
+                    boundary_events = [(int(ep_stage[idx]), int(idx)) for idx in find_forward_boundaries(ep_stage)]
+                else:
+                    boundary_events = find_unique_stage_boundary_events(ep_stage)
             else:
-                boundaries = find_unique_stage_boundaries(ep_stage)
-            for local_boundary in boundaries:
+                ascent_stages = ep_stage[:failure_prefix_end]
+                if boundary_mode == "forward_crossing":
+                    boundary_events = [
+                        (int(ascent_stages[idx]), int(idx))
+                        for idx in find_forward_boundaries(ascent_stages)
+                        if int(ascent_stages[idx]) <= failure_max_stage
+                    ]
+                else:
+                    boundary_events = find_unique_stage_boundary_events(ascent_stages, max_stage=failure_max_stage)
+
+            for _target_stage, local_boundary in boundary_events:
                 boundary_count += 1
                 starts = boundary_candidate_starts(
                     boundary_index=int(local_boundary),
@@ -216,6 +293,7 @@ def mine_stage_chunks(
                         for start in starts
                         if local_chunk_type[start] == CHUNK_TYPE_FORWARD_TRANSITION
                         and np.isfinite(local_advantages[start])
+                        and (ep_success or start + chunk_size < failure_prefix_end)
                     ],
                     dtype=np.int64,
                 )
@@ -241,7 +319,7 @@ def mine_stage_chunks(
 
     intra_selected = 0
     if include_intra_stage:
-        for (_task_idx, _stage_idx), candidates in intra_candidates.items():
+        for (_episode_id, _task_idx, _stage_idx), candidates in intra_candidates.items():
             keep_count = _stage_keep_count(
                 num_candidates=len(candidates),
                 stage_top_ratio=stage_top_ratio,
@@ -270,6 +348,10 @@ def mine_stage_chunks(
         "boundary_candidates": int(boundary_candidate_count),
         "boundary_selected": int(np.sum(selection_role == SELECTION_BOUNDARY_TRANSITION)),
         "boundary_mode": boundary_mode,
+        "success_episodes": int(success_episode_count),
+        "failure_episodes": int(failure_episode_count),
+        "failure_max_stage": int(failure_max_stage),
+        "intra_selection_scope": "episode_stage",
     }
     return StageChunkMiningResult(
         normalized_value=normalized_value,
