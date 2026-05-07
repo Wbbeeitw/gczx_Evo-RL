@@ -448,7 +448,7 @@ lerobot-stage-chunk-mine \
 ```
 
 This reuses the value column from `lerobot-value-infer` and applies success-aware stage-aware chunk
-mining. Successful episodes use the monotonic envelope of per-episode value stages, then keep the
+mining. Successful episodes use the running-max value envelope before per-episode staging, then keep the
 top chunks inside each stage and at most `boundary_top_k` NMS-filtered chunks for each newly reached
 stage boundary. Failed episodes keep their rise/fall stage shape and only mine the rising prefix
 before the first stage descent, capped by `--mining.failure_max_stage`.

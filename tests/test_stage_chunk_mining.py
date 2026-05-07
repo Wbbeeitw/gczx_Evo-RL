@@ -100,6 +100,22 @@ class TestStageChunkMining(unittest.TestCase):
         self.assertEqual(int(np.min(result.stage)), 0)
         self.assertEqual(int(np.max(result.stage)), 4)
 
+    def test_success_episode_minmax_starts_from_initial_progress(self):
+        values = np.asarray([5.0, 4.0, 6.25, 7.5, 8.75, 10.0], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            episode_success={0: True},
+            num_stages=5,
+            chunk_size=1,
+            include_intra_stage=False,
+            include_boundary=False,
+        )
+        np.testing.assert_array_equal(result.stage, np.asarray([0, 0, 1, 2, 3, 4], dtype=np.int64))
+
     def test_failed_episode_only_mines_before_first_stage_descent(self):
         values = np.asarray(
             [-0.95, -0.95, -0.75, -0.75, -0.55, -0.55, -0.75, -0.75, -0.95, -0.95],

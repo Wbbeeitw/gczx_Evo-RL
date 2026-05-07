@@ -206,6 +206,8 @@ def mine_stage_chunks(
         raw_ep_values = values[positions]
         if value_normalization == "episode_minmax":
             ep_values = smooth_values(raw_ep_values, value_smoothing_window)
+            if ep_success:
+                ep_values = np.maximum.accumulate(ep_values)
             ep_values = normalize_values(ep_values, value_normalization)
         else:
             ep_values = normalize_values(raw_ep_values, value_normalization)
