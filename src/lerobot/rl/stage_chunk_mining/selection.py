@@ -203,8 +203,13 @@ def mine_stage_chunks(
             failure_episode_count += 1
 
         positions = np.arange(total, dtype=np.int64)[ep_slice]
-        ep_values = normalize_values(values[positions], value_normalization)
-        ep_values = smooth_values(ep_values, value_smoothing_window)
+        raw_ep_values = values[positions]
+        if value_normalization == "episode_minmax":
+            ep_values = smooth_values(raw_ep_values, value_smoothing_window)
+            ep_values = normalize_values(ep_values, value_normalization)
+        else:
+            ep_values = normalize_values(raw_ep_values, value_normalization)
+            ep_values = smooth_values(ep_values, value_smoothing_window)
         ep_completion, ep_stage = values_to_stages(ep_values, num_stages)
 
         # Successful demonstrations represent monotonic task progress. We keep

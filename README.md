@@ -465,7 +465,7 @@ complementary_info.vgsacm_<TAG>.indicator
 
 Use `--mining.value_normalization=clip` when the value source is already calibrated to Pi\*0.6-style
 `[-1, 0]` values and you want absolute value thresholds. The default `episode_minmax` mode builds
-stage thresholds from each episode's own value range. The default boundary mode,
+stage thresholds from each episode's own value range after optional smoothing. The default boundary mode,
 `unique_stage_boundary`, keeps at most `boundary_top_k` chunks for each newly reached stage boundary
 in an episode, avoiding repeated selections when framewise values jitter around the same stage
 threshold. Use `--mining.boundary_mode=forward_crossing` only for legacy comparisons against every
