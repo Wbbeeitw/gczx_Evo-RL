@@ -443,15 +443,15 @@ lerobot-stage-chunk-mine \
   --mining.stage_top_ratio=0.2 \
   --mining.boundary_top_k=1 \
   --mining.boundary_mode=unique_stage_boundary \
-  --mining.value_smoothing_window=15 \
   --mining.failure_max_stage=2
 ```
 
 This reuses the value column from `lerobot-value-infer` and applies success-aware stage-aware chunk
-mining. Successful episodes use the running-max value envelope before per-episode staging, then keep the
-top chunks inside each stage and at most `boundary_top_k` NMS-filtered chunks for each newly reached
-stage boundary. Failed episodes keep their rise/fall stage shape and only mine the rising prefix
-before the first stage descent, capped by `--mining.failure_max_stage`.
+mining. The method first normalizes the original frame values and divides each episode's value range
+into `M` threshold stages without smoothing. Successful episodes start at stage 0 and advance only
+when the value first reaches the next threshold, so an episode that starts above the minimum does not
+start in a later stage. Failed episodes keep their rise/fall threshold stages, then mine only stages
+that participate in forward transitions before the first descent, capped by `--mining.failure_max_stage`.
 
 The output is a binary indicator for policy post-training:
 
@@ -465,11 +465,11 @@ complementary_info.vgsacm_<TAG>.indicator
 
 Use `--mining.value_normalization=clip` when the value source is already calibrated to Pi\*0.6-style
 `[-1, 0]` values and you want absolute value thresholds. The default `episode_minmax` mode builds
-stage thresholds from each episode's own value range after optional smoothing. The default boundary mode,
+stage thresholds from each episode's own value range. The default boundary mode,
 `unique_stage_boundary`, keeps at most `boundary_top_k` chunks for each newly reached stage boundary
-in an episode, avoiding repeated selections when framewise values jitter around the same stage
-threshold. Use `--mining.boundary_mode=forward_crossing` only for legacy comparisons against every
-local upward stage crossing.
+in an episode, avoiding repeated selections when framewise values revisit the same threshold. Use
+`--mining.boundary_mode=forward_crossing` only for legacy comparisons against every local upward
+stage crossing.
 
 <a id="policy-training"></a>
 

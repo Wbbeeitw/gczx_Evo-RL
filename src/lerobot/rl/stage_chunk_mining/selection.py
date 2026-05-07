@@ -16,7 +16,7 @@ from lerobot.rl.stage_chunk_mining.boundary import (
 )
 from lerobot.rl.stage_chunk_mining.chunks import iter_episode_slices, valid_chunk_start_count
 from lerobot.rl.stage_chunk_mining.nms import temporal_nms
-from lerobot.rl.stage_chunk_mining.stages import normalize_values, smooth_values, values_to_stages
+from lerobot.rl.stage_chunk_mining.stages import normalize_values, values_to_stages
 
 CHUNK_TYPE_INVALID = 0
 CHUNK_TYPE_INTRA_STAGE = 1
@@ -129,6 +129,33 @@ def _first_descent_index(stages: np.ndarray) -> int:
     return int(stages.size)
 
 
+def _first_reach_stage_bins(raw_stages: np.ndarray, num_stages: int) -> np.ndarray:
+    if raw_stages.size == 0:
+        return raw_stages.astype(np.int64, copy=True)
+    first_stage = int(raw_stages[0])
+    reached = np.maximum.accumulate(raw_stages.astype(np.int64, copy=False))
+    return np.clip(reached - first_stage, 0, num_stages - 1).astype(np.int64)
+
+
+def _failure_eligible_stages(
+    stages: np.ndarray,
+    *,
+    prefix_end: int,
+    max_stage: int,
+) -> set[int]:
+    eligible: set[int] = set()
+    end = min(int(prefix_end), int(stages.size))
+    for idx in range(1, end):
+        prev_stage = int(stages[idx - 1])
+        next_stage = int(stages[idx])
+        if next_stage <= prev_stage:
+            continue
+        high_stage = min(next_stage, int(max_stage))
+        low_stage = min(prev_stage, high_stage)
+        eligible.update(range(low_stage, high_stage + 1))
+    return eligible
+
+
 def _window_chunk_type(stages: np.ndarray) -> int:
     if stages.size == 0:
         return CHUNK_TYPE_INVALID
@@ -203,24 +230,13 @@ def mine_stage_chunks(
             failure_episode_count += 1
 
         positions = np.arange(total, dtype=np.int64)[ep_slice]
-        raw_ep_values = values[positions]
-        if value_normalization == "episode_minmax":
-            ep_values = smooth_values(raw_ep_values, value_smoothing_window)
-            if ep_success:
-                ep_values = np.maximum.accumulate(ep_values)
-            ep_values = normalize_values(ep_values, value_normalization)
-        else:
-            ep_values = normalize_values(raw_ep_values, value_normalization)
-            ep_values = smooth_values(ep_values, value_smoothing_window)
-        ep_completion, ep_stage = values_to_stages(ep_values, num_stages)
+        ep_values = normalize_values(values[positions], value_normalization)
+        ep_completion, raw_ep_stage = values_to_stages(ep_values, num_stages)
 
-        # Successful demonstrations represent monotonic task progress. We keep
-        # only the first arrival at each higher stage so threshold jitter cannot
-        # create repeated semantic boundaries. Failed trajectories keep their
-        # raw stage shape, e.g. 0->1->2->1->0, so the first descent can cut off
-        # later non-advantage behavior.
         if ep_success:
-            ep_stage = np.maximum.accumulate(ep_stage)
+            ep_stage = _first_reach_stage_bins(raw_ep_stage, num_stages)
+        else:
+            ep_stage = raw_ep_stage
 
         normalized_value[positions] = ep_values
         completion[positions] = ep_completion
@@ -234,6 +250,15 @@ def mine_stage_chunks(
         local_advantages = np.full(episode_length, np.nan, dtype=np.float32)
         local_chunk_type = np.zeros(episode_length, dtype=np.int64)
         failure_prefix_end = episode_length if ep_success else _first_descent_index(ep_stage)
+        failure_eligible_stages = (
+            set(range(num_stages))
+            if ep_success
+            else _failure_eligible_stages(
+                ep_stage,
+                prefix_end=failure_prefix_end,
+                max_stage=failure_max_stage,
+            )
+        )
 
         for local_t in range(num_starts):
             start_pos = int(positions[local_t])
@@ -255,6 +280,7 @@ def mine_stage_chunks(
                 allowed_failure_window = (
                     local_t + chunk_size < failure_prefix_end
                     and int(np.max(stage_window)) <= failure_max_stage
+                    and int(ep_stage[local_t]) in failure_eligible_stages
                 )
                 if not allowed_failure_window:
                     ctype = CHUNK_TYPE_INVALID
@@ -359,6 +385,9 @@ def mine_stage_chunks(
         "failure_episodes": int(failure_episode_count),
         "failure_max_stage": int(failure_max_stage),
         "intra_selection_scope": "episode_stage",
+        "stage_assignment": "success_first_reach_failure_raw_threshold",
+        "value_smoothing_applied": False,
+        "value_smoothing_window": int(value_smoothing_window),
     }
     return StageChunkMiningResult(
         normalized_value=normalized_value,
