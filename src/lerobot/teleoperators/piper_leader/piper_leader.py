@@ -114,7 +114,11 @@ class PiperLeader(Teleoperator):
         self._last_feedback_joint_timestamp = 0.0
         self._last_feedback_gripper_timestamp = 0.0
         try:
-            self.configure()
+            # `lerobot-calibrate` calls connect(calibrate=False) before invoking
+            # calibrate(). Do not enter manual-control/gravity-compensation mode
+            # on that path; calibration puts the arm in a free mode itself.
+            if calibrate:
+                self.configure()
             if not self.is_calibrated and calibrate and self.config.require_calibration:
                 logger.info(
                     "No piper-leader calibration file found for '%s'. Running lerobot-calibrate flow.",
@@ -152,6 +156,10 @@ class PiperLeader(Teleoperator):
                 return
 
         logger.info("Running calibration for %s", self)
+        self._stop_gravity_comp_loop_if_needed()
+        self._set_gripper_enabled(False)
+        self.arm.DisableArm(7)
+        time.sleep(0.1)
         input("Move piper-leader to your desired neutral/center pose, then press ENTER...")
         neutral = self._read_raw_action()
         print("Move all piper-leader joints through full range. Press ENTER to stop recording...")
