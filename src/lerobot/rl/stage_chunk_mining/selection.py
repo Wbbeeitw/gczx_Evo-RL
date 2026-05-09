@@ -8,7 +8,7 @@ from math import ceil
 
 import numpy as np
 
-from lerobot.rl.stage_chunk_mining.advantage import compute_chunk_advantage, safe_l_max
+from lerobot.rl.stage_chunk_mining.advantage import compute_chunk_advantages_batch, safe_l_max
 from lerobot.rl.stage_chunk_mining.boundary import (
     boundary_candidate_starts,
     find_forward_boundaries,
@@ -292,6 +292,14 @@ def mine_stage_chunks(
 
         local_advantages = np.full(episode_length, np.nan, dtype=np.float32)
         local_chunk_type = np.zeros(episode_length, dtype=np.int64)
+        episode_task_idx = int(task_indices[positions[0]])
+        l_max = safe_l_max(l_max_by_task.get(episode_task_idx, episode_length), chunk_size)
+        computed_advantages = compute_chunk_advantages_batch(
+            values=ep_values,
+            chunk_size=chunk_size,
+            l_max=l_max,
+            lam=0.95,
+        )
         failure_prefix_end = episode_length if ep_success else _first_descent_index(ep_stage)
         failure_eligible_stages = (
             set(range(num_stages))
@@ -305,16 +313,8 @@ def mine_stage_chunks(
 
         for local_t in range(num_starts):
             start_pos = int(positions[local_t])
-            end_pos = int(positions[local_t + chunk_size])
             task_idx = int(task_indices[start_pos])
-            l_max = safe_l_max(l_max_by_task.get(task_idx, episode_length), chunk_size)
-
-            adv = compute_chunk_advantage(
-                start_value=float(ep_values[local_t]),
-                bootstrap_value=float(ep_values[local_t + chunk_size]),
-                chunk_size=chunk_size,
-                l_max=l_max,
-            )
+            adv = float(computed_advantages[local_t])
             stage_window = ep_stage[local_t : local_t + chunk_size + 1]
             ctype = _window_chunk_type(stage_window)
 

@@ -26,7 +26,8 @@ class TestStageChunkMining(unittest.TestCase):
         np.testing.assert_allclose(normalized, np.asarray([-1.0, -0.5, 0.0], dtype=np.float32))
 
     def test_chunk_advantage_formula(self):
-        advantage = compute_chunk_advantage(start_value=-0.8, bootstrap_value=-0.4, chunk_size=50, l_max=200)
+        values = np.linspace(-0.8, -0.4, 51, dtype=np.float64)
+        advantage = compute_chunk_advantage(values, chunk_size=50, l_max=200, lam=1.0)
         self.assertAlmostEqual(advantage, 0.15, places=6)
 
     def test_stage_top_ratio_selects_intra_stage_chunks(self):
