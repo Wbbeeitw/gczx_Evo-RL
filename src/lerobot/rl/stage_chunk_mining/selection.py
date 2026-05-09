@@ -36,6 +36,8 @@ class StageChunkMiningResult:
     chunk_advantage: np.ndarray
     chunk_type: np.ndarray
     chunk_stage: np.ndarray
+    chunk_start_indicator: np.ndarray
+    chunk_start_role: np.ndarray
     boundary_id: np.ndarray
     indicator: np.ndarray
     weight: np.ndarray
@@ -50,6 +52,8 @@ class StageChunkMiningResult:
             f"{prefix}.chunk_advantage": self.chunk_advantage.astype(np.float32, copy=False),
             f"{prefix}.chunk_type": self.chunk_type.astype(np.int64, copy=False),
             f"{prefix}.chunk_stage": self.chunk_stage.astype(np.int64, copy=False),
+            f"{prefix}.chunk_start_indicator": self.chunk_start_indicator.astype(np.int64, copy=False),
+            f"{prefix}.chunk_start_role": self.chunk_start_role.astype(np.int64, copy=False),
             f"{prefix}.boundary_id": self.boundary_id.astype(np.int64, copy=False),
             f"{prefix}.indicator": self.indicator.astype(np.int64, copy=False),
             f"{prefix}.weight": self.weight.astype(np.float32, copy=False),
@@ -167,6 +171,41 @@ def _window_chunk_type(stages: np.ndarray) -> int:
     return CHUNK_TYPE_FORWARD_TRANSITION
 
 
+def _mark_selected_chunk(
+    *,
+    positions: np.ndarray,
+    local_start: int,
+    chunk_size: int,
+    role: int,
+    boundary_index: int,
+    chunk_start_indicator: np.ndarray,
+    chunk_start_role: np.ndarray,
+    indicator: np.ndarray,
+    weight: np.ndarray,
+    selection_role: np.ndarray,
+    boundary_id: np.ndarray,
+) -> None:
+    start_pos = int(positions[local_start])
+    chunk_start_indicator[start_pos] = 1
+    chunk_start_role[start_pos] = int(role)
+
+    local_end = min(int(local_start) + int(chunk_size), int(positions.size))
+    chunk_positions = positions[int(local_start) : local_end]
+
+    indicator[chunk_positions] = 1
+    weight[chunk_positions] = 1.0
+
+    # Boundary chunks should remain visible when overlapping with intra-stage chunks.
+    role_update_mask = (selection_role[chunk_positions] == SELECTION_NONE) | (
+        int(role) > selection_role[chunk_positions]
+    )
+    role_positions = chunk_positions[role_update_mask]
+    selection_role[role_positions] = int(role)
+
+    if int(role) == SELECTION_BOUNDARY_TRANSITION:
+        boundary_id[chunk_positions] = int(boundary_index)
+
+
 def mine_stage_chunks(
     *,
     values: np.ndarray,
@@ -202,12 +241,15 @@ def mine_stage_chunks(
     chunk_advantage = np.full(total, np.nan, dtype=np.float32)
     chunk_type = np.zeros(total, dtype=np.int64)
     chunk_stage = np.full(total, -1, dtype=np.int64)
+    chunk_start_indicator = np.zeros(total, dtype=np.int64)
+    chunk_start_role = np.zeros(total, dtype=np.int64)
     boundary_id = np.full(total, -1, dtype=np.int64)
     indicator = np.zeros(total, dtype=np.int64)
     weight = np.zeros(total, dtype=np.float32)
     selection_role = np.zeros(total, dtype=np.int64)
 
     intra_candidates: dict[tuple[int, int, int], list[tuple[int, float]]] = defaultdict(list)
+    episode_positions_by_id: dict[int, np.ndarray] = {}
     boundary_count = 0
     boundary_candidate_count = 0
     success_episode_count = 0
@@ -230,6 +272,7 @@ def mine_stage_chunks(
             failure_episode_count += 1
 
         positions = np.arange(total, dtype=np.int64)[ep_slice]
+        episode_positions_by_id[int(episode_id)] = positions
         ep_values = normalize_values(values[positions], value_normalization)
         ep_completion, raw_ep_stage = values_to_stages(ep_values, num_stages)
 
@@ -287,7 +330,7 @@ def mine_stage_chunks(
 
             if ctype == CHUNK_TYPE_INTRA_STAGE:
                 ctype = CHUNK_TYPE_INTRA_STAGE
-                intra_candidates[(int(episode_id), task_idx, int(ep_stage[local_t]))].append((start_pos, adv))
+                intra_candidates[(int(episode_id), task_idx, int(ep_stage[local_t]))].append((local_t, adv))
 
             chunk_advantage[start_pos] = np.float32(adv)
             chunk_type[start_pos] = ctype
@@ -344,15 +387,23 @@ def mine_stage_chunks(
                 )
                 for kept_idx in kept_local_indices:
                     local_start = int(starts[kept_idx])
-                    start_pos = int(positions[local_start])
-                    indicator[start_pos] = 1
-                    weight[start_pos] = 1.0
-                    selection_role[start_pos] = SELECTION_BOUNDARY_TRANSITION
-                    boundary_id[start_pos] = boundary_count - 1
+                    _mark_selected_chunk(
+                        positions=positions,
+                        local_start=local_start,
+                        chunk_size=chunk_size,
+                        role=SELECTION_BOUNDARY_TRANSITION,
+                        boundary_index=boundary_count - 1,
+                        chunk_start_indicator=chunk_start_indicator,
+                        chunk_start_role=chunk_start_role,
+                        indicator=indicator,
+                        weight=weight,
+                        selection_role=selection_role,
+                        boundary_id=boundary_id,
+                    )
 
     intra_selected = 0
     if include_intra_stage:
-        for (_episode_id, _task_idx, _stage_idx), candidates in intra_candidates.items():
+        for (episode_id, _task_idx, _stage_idx), candidates in intra_candidates.items():
             keep_count = _stage_keep_count(
                 num_candidates=len(candidates),
                 stage_top_ratio=stage_top_ratio,
@@ -362,24 +413,38 @@ def mine_stage_chunks(
             if keep_count <= 0:
                 continue
             ordered = sorted(candidates, key=lambda item: item[1], reverse=True)
-            for start_pos, _score in ordered[:keep_count]:
-                indicator[start_pos] = 1
-                weight[start_pos] = 1.0
-                selection_role[start_pos] = SELECTION_INTRA_STAGE_TOP
+            positions = episode_positions_by_id[int(episode_id)]
+            for local_start, _score in ordered[:keep_count]:
+                _mark_selected_chunk(
+                    positions=positions,
+                    local_start=int(local_start),
+                    chunk_size=chunk_size,
+                    role=SELECTION_INTRA_STAGE_TOP,
+                    boundary_index=-1,
+                    chunk_start_indicator=chunk_start_indicator,
+                    chunk_start_role=chunk_start_role,
+                    indicator=indicator,
+                    weight=weight,
+                    selection_role=selection_role,
+                    boundary_id=boundary_id,
+                )
                 intra_selected += 1
 
-    selected_count = int(np.sum(indicator))
+    selected_count = int(np.sum(chunk_start_indicator))
+    positive_frame_count = int(np.sum(indicator))
     report = {
         "total_frames": int(total),
         "valid_chunk_starts": int(np.sum(chunk_type != CHUNK_TYPE_INVALID)),
         "selected_chunks": selected_count,
         "selected_ratio": float(selected_count / max(int(np.sum(chunk_type != CHUNK_TYPE_INVALID)), 1)),
+        "positive_frames": positive_frame_count,
+        "positive_frame_ratio": float(positive_frame_count / max(total, 1)),
         "intra_candidate_groups": int(len(intra_candidates)),
         "intra_candidates": int(sum(len(items) for items in intra_candidates.values())),
         "intra_selected": int(intra_selected),
         "boundary_count": int(boundary_count),
         "boundary_candidates": int(boundary_candidate_count),
-        "boundary_selected": int(np.sum(selection_role == SELECTION_BOUNDARY_TRANSITION)),
+        "boundary_selected": int(np.sum(chunk_start_role == SELECTION_BOUNDARY_TRANSITION)),
         "boundary_mode": boundary_mode,
         "success_episodes": int(success_episode_count),
         "failure_episodes": int(failure_episode_count),
@@ -396,6 +461,8 @@ def mine_stage_chunks(
         chunk_advantage=chunk_advantage,
         chunk_type=chunk_type,
         chunk_stage=chunk_stage,
+        chunk_start_indicator=chunk_start_indicator,
+        chunk_start_role=chunk_start_role,
         boundary_id=boundary_id,
         indicator=indicator,
         weight=weight,

@@ -191,6 +191,8 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
         task_indices=task_indices,
         stage=result.stage,
         chunk_type=result.chunk_type,
+        chunk_start_indicator=result.chunk_start_indicator,
+        chunk_start_role=result.chunk_start_role,
         indicator=result.indicator,
         selection_role=result.selection_role,
     )
@@ -203,6 +205,7 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
     report["failure_max_stage"] = cfg.mining.failure_max_stage
     report["output_prefix"] = cfg.mining.output_prefix
     report["indicator_field"] = f"{cfg.mining.output_prefix}.indicator"
+    report["chunk_start_indicator_field"] = f"{cfg.mining.output_prefix}.chunk_start_indicator"
 
     report_path = save_report(report, Path(cfg.output_dir))
     logging.info("Wrote stage chunk annotations to dataset root: %s", dataset.root)

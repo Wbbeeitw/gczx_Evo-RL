@@ -45,6 +45,7 @@ class TestStageChunkMining(unittest.TestCase):
         )
         self.assertGreater(int(np.sum(result.selection_role == SELECTION_INTRA_STAGE_TOP)), 0)
         self.assertEqual(int(np.sum(result.indicator)), int(np.sum(result.selection_role == SELECTION_INTRA_STAGE_TOP)))
+        np.testing.assert_array_equal(result.indicator, result.chunk_start_indicator)
 
     def test_success_episode_uses_episode_minmax_monotonic_stages(self):
         values = np.asarray([100.0, 125.0, 150.0, 175.0, 200.0], dtype=np.float32)
@@ -177,10 +178,14 @@ class TestStageChunkMining(unittest.TestCase):
             include_intra_stage=False,
             include_boundary=True,
         )
-        selected_starts = set(int(v) for v in np.flatnonzero(result.selection_role == SELECTION_BOUNDARY_TRANSITION))
+        selected_starts = set(int(v) for v in np.flatnonzero(result.chunk_start_role == SELECTION_BOUNDARY_TRANSITION))
         self.assertEqual(selected_starts, {0, 1})
         self.assertEqual(result.report["boundary_count"], 2)
         self.assertEqual(result.report["boundary_selected"], 2)
+        np.testing.assert_array_equal(result.indicator, np.asarray([1, 1, 1, 0, 0, 0], dtype=np.int64))
+        np.testing.assert_array_equal(
+            result.chunk_start_indicator, np.asarray([1, 1, 0, 0, 0, 0], dtype=np.int64)
+        )
 
     def test_boundary_top_one_selects_best_transition_chunk(self):
         values = np.asarray([-0.7, -0.61, -0.59, -0.3], dtype=np.float32)
@@ -198,8 +203,11 @@ class TestStageChunkMining(unittest.TestCase):
             include_intra_stage=False,
             include_boundary=True,
         )
-        self.assertEqual(int(np.sum(result.selection_role == SELECTION_BOUNDARY_TRANSITION)), 1)
-        self.assertEqual(int(np.sum(result.indicator)), 1)
+        self.assertEqual(int(np.sum(result.chunk_start_role == SELECTION_BOUNDARY_TRANSITION)), 1)
+        self.assertEqual(int(np.sum(result.chunk_start_indicator)), 1)
+        self.assertEqual(int(np.sum(result.indicator)), 2)
+        start = int(np.flatnonzero(result.chunk_start_indicator)[0])
+        np.testing.assert_array_equal(result.indicator[start : start + 2], np.ones(2, dtype=np.int64))
 
     def test_unique_stage_boundaries_ignore_threshold_jitter(self):
         stages = np.asarray([3, 3, 4, 4, 3, 3, 4, 4], dtype=np.int64)
@@ -224,7 +232,8 @@ class TestStageChunkMining(unittest.TestCase):
             include_boundary=True,
         )
         self.assertEqual(result.report["boundary_count"], 1)
-        self.assertEqual(int(np.sum(result.selection_role == SELECTION_BOUNDARY_TRANSITION)), 1)
+        self.assertEqual(int(np.sum(result.chunk_start_role == SELECTION_BOUNDARY_TRANSITION)), 1)
+        self.assertEqual(int(np.sum(result.indicator)), 2)
 
 
 if __name__ == "__main__":
