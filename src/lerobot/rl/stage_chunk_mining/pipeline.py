@@ -165,9 +165,13 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
         episode_success=episode_success,
         num_stages=cfg.mining.num_stages,
         chunk_size=cfg.mining.chunk_size,
+        stage_aware=cfg.mining.stage_aware,
         stage_top_ratio=cfg.mining.stage_top_ratio,
         stage_top_k=cfg.mining.stage_top_k,
         min_stage_candidates=cfg.mining.min_stage_candidates,
+        global_top_ratio=cfg.mining.global_top_ratio,
+        global_top_k=cfg.mining.global_top_k,
+        global_min_candidates=cfg.mining.global_min_candidates,
         boundary_top_k=cfg.mining.boundary_top_k,
         boundary_nms_iou=cfg.mining.boundary_nms_iou,
         boundary_mode=cfg.mining.boundary_mode,
@@ -204,6 +208,9 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
     report["default_success"] = cfg.dataset.default_success
     report["failure_max_stage"] = cfg.mining.failure_max_stage
     report["output_prefix"] = cfg.mining.output_prefix
+    report["stage_aware"] = bool(cfg.mining.stage_aware)
+    report["global_top_ratio"] = float(cfg.mining.global_top_ratio)
+    report["global_top_k"] = int(cfg.mining.global_top_k)
     report["indicator_field"] = f"{cfg.mining.output_prefix}.indicator"
     report["chunk_start_indicator_field"] = f"{cfg.mining.output_prefix}.chunk_start_indicator"
 

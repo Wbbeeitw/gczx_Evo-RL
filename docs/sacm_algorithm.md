@@ -267,6 +267,7 @@ lerobot-stage-chunk-mine \
   --mining.value_field=complementary_info.value_sacm \
   --mining.output_prefix=complementary_info.vgsacm_sacm_threshold_r015_chunkmask \
   --mining.value_normalization=episode_minmax \
+  --mining.stage_aware=true \
   --mining.num_stages=5 \
   --mining.chunk_size=50 \
   --mining.stage_top_ratio=0.15 \
@@ -287,6 +288,15 @@ chunk_size / K:
 
 stage_top_ratio:
   每个 episode-stage 组内保留多少比例的 intra-stage 高优势 chunk。
+
+stage_aware:
+  是否启用阶段感知筛选。true 使用 SACM 当前的分阶段和边界逻辑；false 则关闭分阶段筛选，改成每条 episode 内全局滑窗 top-ratio 筛选。
+
+global_top_ratio:
+  stage_aware=false 时，每条 episode 所有合法滑动窗口中保留前多少比例的高 advantage chunk。
+
+global_top_k:
+  stage_aware=false 时，每条 episode 固定保留多少个全局最高 advantage chunk；如果大于 0，优先于 global_top_ratio。
 
 boundary_top_k:
   每个阶段边界附近保留几个最好的 boundary chunk。
@@ -786,7 +796,60 @@ stage_top_k > 0
 
 ---
 
-## 16. 最新实现：优势 Chunk 展开为帧级标签
+## 16. 可选实现：全局 Chunk 筛选
+
+除了默认的 stage-aware SACM，当前代码还支持一个更简单的对照分支：
+
+```bash
+lerobot-stage-chunk-mine \
+  ... \
+  --mining.stage_aware=false \
+  --mining.global_top_ratio=0.15
+```
+
+该模式下仍然会：
+
+```text
+1. 使用 value model 输出每帧 value。
+2. 对每条 episode 的 value 做归一化。
+3. 对所有合法 K-step 滑窗计算 GAE-style chunk advantage。
+```
+
+但它不会使用：
+
+```text
+episode-stage 分组
+boundary chunk
+failure episode 的阶段上升约束
+```
+
+而是对每条 episode 内所有合法 chunk 起点直接按照：
+
+```text
+A_chunk(s)
+```
+
+从高到低排序，然后保留：
+
+```text
+ceil(num_episode_chunks * global_top_ratio)
+```
+
+个 chunk。
+
+如果设置：
+
+```text
+global_top_k > 0
+```
+
+则每条 episode 固定保留 top-k 个全局最高 advantage chunk。
+
+这个模式适合作为 baseline / ablation：它只验证“value-based chunk advantage 筛选”本身，不引入分阶段均衡和阶段边界偏置。
+
+---
+
+## 17. 最新实现：优势 Chunk 展开为帧级标签
 
 这是当前最重要的实现语义。
 
@@ -797,7 +860,7 @@ chunk_start_indicator
 indicator
 ```
 
-### 16.1 chunk_start_indicator
+### 17.1 chunk_start_indicator
 
 `chunk_start_indicator` 只标记被选中的 chunk 起点。
 
@@ -819,7 +882,7 @@ chunk_start_indicator[s] = 1
 
 不应该直接用于 policy 训练。
 
-### 16.2 indicator
+### 17.2 indicator
 
 `indicator` 是真正用于训练的帧级二值标签。
 
@@ -865,7 +928,7 @@ positive_frames <= selected_chunks * K
 
 ---
 
-## 17. SACM 输出字段
+## 18. SACM 输出字段
 
 SACM 会在数据集里写入一组字段，前缀由：
 
@@ -914,7 +977,7 @@ complementary_info.vgsacm_sacm_threshold_r015_chunkmask.chunk_start_indicator
 
 ---
 
-## 18. SACM Report
+## 19. SACM Report
 
 SACM 会输出报告：
 
@@ -930,8 +993,11 @@ positive_frames
 positive_frame_ratio
 valid_chunk_starts
 selected_ratio
+selection_mode
 intra_candidates
 intra_selected
+global_candidates
+global_selected
 boundary_count
 boundary_candidates
 boundary_selected
@@ -957,6 +1023,15 @@ valid_chunk_starts:
 
 selected_ratio:
   selected_chunks / valid_chunk_starts。
+
+selection_mode:
+  当前筛选模式。stage_aware 表示分阶段 SACM；global_top 表示每条 episode 内全局 top-ratio 筛选。
+
+global_candidates:
+  stage_aware=false 时参与全局排序的合法 chunk 起点数量。
+
+global_selected:
+  stage_aware=false 时被全局 top-ratio / top-k 选中的 chunk 起点数量。
 ```
 
 最新实现后，训练标签密度主要看：
@@ -970,7 +1045,7 @@ positive_frame_ratio
 
 ---
 
-## 19. ACP Prompt 注入训练
+## 20. ACP Prompt 注入训练
 
 policy 训练入口是：
 
@@ -1073,7 +1148,7 @@ Advantage: negative
 
 ---
 
-## 20. PI05 如何接收 Advantage Prompt
+## 21. PI05 如何接收 Advantage Prompt
 
 `pi05` 的文本处理逻辑在：
 
@@ -1121,7 +1196,7 @@ train_expert_only=true
 
 ---
 
-## 21. 推理阶段
+## 22. 推理阶段
 
 推理阶段不会运行 SACM。
 
@@ -1166,7 +1241,7 @@ advantage-conditioned inference
 
 ---
 
-## 22. 建议的诊断实验
+## 23. 建议的诊断实验
 
 为了判断 Advantage 条件是否真的被模型学到，建议比较同一个 checkpoint 下三种 prompt：
 
@@ -1225,7 +1300,7 @@ VLM 冻结，Advantage tag 条件较弱；
 
 ---
 
-## 23. 当前实现中的关键字段语义
+## 24. 当前实现中的关键字段语义
 
 当前实现中，几个字段的语义如下：
 
@@ -1265,7 +1340,7 @@ weight:
 
 ---
 
-## 24. 修改 SACM 标签后哪些步骤要重跑
+## 25. 修改 SACM 标签后哪些步骤要重跑
 
 如果 value model 已经训练好，且数据集里已经有：
 
@@ -1306,7 +1381,7 @@ complementary_info.vgsacm_sacm_threshold_r015_chunkmask
 
 ---
 
-## 25. 方法总结
+## 26. 方法总结
 
 SACM 当前实现可以总结为：
 
@@ -1319,12 +1394,13 @@ SACM 当前实现可以总结为：
 6. 失败 episode 只在首次下降前的上升阶段挖 chunk。
 7. 用 K-step 滑窗枚举 action chunks。
 8. 用 GAE-style 的 TD error 累加计算 chunk advantage。
-9. 阶段边界处保留 boundary_top_k 个优势 chunk。
-10. 每个 episode-stage 内保留 top stage_top_ratio 的 intra-stage chunk。
-11. 把被选中 chunk 的 K 帧全部标为 indicator=1。
-12. 训练 policy 时把 indicator=1 转成 Advantage: positive。
-13. 把 indicator=0 转成 Advantage: negative。
-14. 推理时输入 Advantage: positive，得到优势条件动作 chunk。
+9. 默认 stage_aware=true 时，阶段边界处保留 boundary_top_k 个优势 chunk。
+10. 默认 stage_aware=true 时，每个 episode-stage 内保留 top stage_top_ratio 的 intra-stage chunk。
+11. 可选 stage_aware=false 时，每条 episode 内全局保留 top global_top_ratio 的高优势 chunk。
+12. 把被选中 chunk 的 K 帧全部标为 indicator=1。
+13. 训练 policy 时把 indicator=1 转成 Advantage: positive。
+14. 把 indicator=0 转成 Advantage: negative。
+15. 推理时输入 Advantage: positive，得到优势条件动作 chunk。
 ```
 
 最关键的最新语义是：

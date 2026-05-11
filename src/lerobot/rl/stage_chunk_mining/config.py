@@ -38,11 +38,16 @@ class StageChunkMiningConfig:
     output_prefix: str = "complementary_info.vgsacm"
     value_normalization: str = "episode_minmax"
 
+    stage_aware: bool = True
     num_stages: int = 5
     chunk_size: int = 50
     stage_top_ratio: float = 0.3
     stage_top_k: int = 0
     min_stage_candidates: int = 1
+
+    global_top_ratio: float = 0.3
+    global_top_k: int = 0
+    global_min_candidates: int = 1
 
     boundary_top_k: int = 1
     boundary_nms_iou: float = 0.5
@@ -75,6 +80,12 @@ class StageChunkMiningConfig:
             raise ValueError("'mining.stage_top_k' must be >= 0.")
         if self.min_stage_candidates < 0:
             raise ValueError("'mining.min_stage_candidates' must be >= 0.")
+        if not 0.0 <= self.global_top_ratio <= 1.0:
+            raise ValueError("'mining.global_top_ratio' must be within [0, 1].")
+        if self.global_top_k < 0:
+            raise ValueError("'mining.global_top_k' must be >= 0.")
+        if self.global_min_candidates < 0:
+            raise ValueError("'mining.global_min_candidates' must be >= 0.")
         if self.boundary_top_k < 0:
             raise ValueError("'mining.boundary_top_k' must be >= 0.")
         if not 0.0 <= self.boundary_nms_iou <= 1.0:
@@ -96,8 +107,13 @@ class StageChunkMiningConfig:
             raise ValueError(
                 f"'mining.l_max_mode' must be one of {sorted(valid_l_max_modes)}, got {self.l_max_mode!r}."
             )
-        if not self.include_intra_stage and not self.include_boundary:
+        if self.stage_aware and not self.include_intra_stage and not self.include_boundary:
             raise ValueError("At least one of 'include_intra_stage' or 'include_boundary' must be true.")
+        if not self.stage_aware and self.global_top_k == 0 and self.global_top_ratio <= 0.0:
+            raise ValueError(
+                "When 'mining.stage_aware=false', set either 'mining.global_top_ratio' > 0 "
+                "or 'mining.global_top_k' > 0."
+            )
 
 
 @dataclass

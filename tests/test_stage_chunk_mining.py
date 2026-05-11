@@ -8,6 +8,7 @@ from lerobot.rl.stage_chunk_mining.advantage import compute_chunk_advantage
 from lerobot.rl.stage_chunk_mining.boundary import find_forward_boundaries, find_unique_stage_boundaries
 from lerobot.rl.stage_chunk_mining.selection import (
     SELECTION_BOUNDARY_TRANSITION,
+    SELECTION_GLOBAL_TOP,
     SELECTION_INTRA_STAGE_TOP,
     mine_stage_chunks,
 )
@@ -47,6 +48,65 @@ class TestStageChunkMining(unittest.TestCase):
         self.assertGreater(int(np.sum(result.selection_role == SELECTION_INTRA_STAGE_TOP)), 0)
         self.assertEqual(int(np.sum(result.indicator)), int(np.sum(result.selection_role == SELECTION_INTRA_STAGE_TOP)))
         np.testing.assert_array_equal(result.indicator, result.chunk_start_indicator)
+
+    def test_global_top_ratio_selects_best_episode_windows_without_stage_filtering(self):
+        values = np.asarray([-0.9, -0.8, -0.79, -0.7, -0.69, -0.6], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            num_stages=5,
+            chunk_size=1,
+            value_normalization="clip",
+            stage_aware=False,
+            global_top_ratio=0.4,
+        )
+        selected_starts = set(int(v) for v in np.flatnonzero(result.chunk_start_indicator))
+        self.assertEqual(selected_starts, {0, 2})
+        self.assertEqual(result.report["selection_mode"], "global_top")
+        self.assertEqual(result.report["global_candidates"], 5)
+        self.assertEqual(result.report["global_selected"], 2)
+        self.assertEqual(int(np.sum(result.chunk_start_role == SELECTION_GLOBAL_TOP)), 2)
+        self.assertEqual(int(np.sum(result.chunk_start_role == SELECTION_BOUNDARY_TRANSITION)), 0)
+
+    def test_global_top_selection_marks_all_frames_inside_selected_chunk(self):
+        values = np.asarray([-0.9, -0.8, -0.7, -0.72, -0.74], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            num_stages=5,
+            chunk_size=2,
+            value_normalization="clip",
+            stage_aware=False,
+            global_top_k=1,
+        )
+        np.testing.assert_array_equal(result.chunk_start_indicator, np.asarray([1, 0, 0, 0, 0], dtype=np.int64))
+        np.testing.assert_array_equal(result.indicator, np.asarray([1, 1, 0, 0, 0], dtype=np.int64))
+        self.assertEqual(int(np.sum(result.selection_role == SELECTION_GLOBAL_TOP)), 2)
+
+    def test_global_top_mode_uses_all_windows_in_failed_episode(self):
+        values = np.asarray([-0.8, -0.6, -0.9, -0.5], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            episode_success={0: False},
+            num_stages=5,
+            chunk_size=1,
+            value_normalization="clip",
+            stage_aware=False,
+            global_top_k=1,
+        )
+        self.assertEqual(result.report["failure_episodes"], 1)
+        self.assertEqual(result.report["global_candidates"], 3)
+        np.testing.assert_array_equal(result.chunk_start_indicator, np.asarray([0, 0, 1, 0], dtype=np.int64))
 
     def test_success_episode_uses_episode_minmax_monotonic_stages(self):
         values = np.asarray([100.0, 125.0, 150.0, 175.0, 200.0], dtype=np.float32)

@@ -26,6 +26,7 @@ CHUNK_TYPE_REGRESSION = 3
 SELECTION_NONE = 0
 SELECTION_INTRA_STAGE_TOP = 1
 SELECTION_BOUNDARY_TRANSITION = 2
+SELECTION_GLOBAL_TOP = 3
 
 
 @dataclass
@@ -107,6 +108,21 @@ def _stage_keep_count(num_candidates: int, stage_top_ratio: float, stage_top_k: 
     if stage_top_ratio <= 0.0:
         return 0
     return min(num_candidates, max(min_candidates, int(ceil(num_candidates * stage_top_ratio))))
+
+
+def _global_keep_count(
+    num_candidates: int,
+    global_top_ratio: float,
+    global_top_k: int,
+    min_candidates: int,
+) -> int:
+    if num_candidates <= 0:
+        return 0
+    if global_top_k > 0:
+        return min(global_top_k, num_candidates)
+    if global_top_ratio <= 0.0:
+        return 0
+    return min(num_candidates, max(min_candidates, int(ceil(num_candidates * global_top_ratio))))
 
 
 def _episode_success_value(episode_success: dict[int, bool] | np.ndarray | None, episode_id: int) -> bool:
@@ -216,9 +232,13 @@ def mine_stage_chunks(
     episode_success: dict[int, bool] | np.ndarray | None = None,
     num_stages: int = 5,
     chunk_size: int = 50,
+    stage_aware: bool = True,
     stage_top_ratio: float = 0.3,
     stage_top_k: int = 0,
     min_stage_candidates: int = 1,
+    global_top_ratio: float = 0.3,
+    global_top_k: int = 0,
+    global_min_candidates: int = 1,
     boundary_top_k: int = 1,
     boundary_nms_iou: float = 0.5,
     boundary_mode: str = "unique_stage_boundary",
@@ -262,6 +282,15 @@ def mine_stage_chunks(
         )
     if failure_max_stage < 0 or failure_max_stage >= num_stages:
         raise ValueError("'failure_max_stage' must be within [0, num_stages).")
+    if not 0.0 <= global_top_ratio <= 1.0:
+        raise ValueError("'global_top_ratio' must be within [0, 1].")
+    if global_top_k < 0:
+        raise ValueError("'global_top_k' must be >= 0.")
+    if global_min_candidates < 0:
+        raise ValueError("'global_min_candidates' must be >= 0.")
+
+    global_candidate_count = 0
+    global_selected = 0
 
     for episode_id, ep_slice in iter_episode_slices(episode_indices):
         _validate_episode_slice(frame_indices=frame_indices, task_indices=task_indices, ep_slice=ep_slice)
@@ -319,7 +348,7 @@ def mine_stage_chunks(
             ctype = _window_chunk_type(stage_window)
 
             allowed_failure_window = True
-            if not ep_success:
+            if stage_aware and not ep_success:
                 allowed_failure_window = (
                     local_t + chunk_size < failure_prefix_end
                     and int(np.max(stage_window)) <= failure_max_stage
@@ -328,7 +357,7 @@ def mine_stage_chunks(
                 if not allowed_failure_window:
                     ctype = CHUNK_TYPE_INVALID
 
-            if ctype == CHUNK_TYPE_INTRA_STAGE:
+            if stage_aware and ctype == CHUNK_TYPE_INTRA_STAGE:
                 ctype = CHUNK_TYPE_INTRA_STAGE
                 intra_candidates[(int(episode_id), task_idx, int(ep_stage[local_t]))].append((local_t, adv))
 
@@ -337,6 +366,46 @@ def mine_stage_chunks(
             chunk_stage[start_pos] = int(ep_stage[local_t])
             local_advantages[local_t] = np.float32(adv)
             local_chunk_type[local_t] = ctype
+
+        if not stage_aware:
+            starts = np.asarray(
+                [
+                    local_t
+                    for local_t in range(num_starts)
+                    if local_chunk_type[local_t] != CHUNK_TYPE_INVALID
+                    and np.isfinite(local_advantages[local_t])
+                ],
+                dtype=np.int64,
+            )
+            global_candidate_count += int(starts.size)
+            keep_count = _global_keep_count(
+                num_candidates=int(starts.size),
+                global_top_ratio=global_top_ratio,
+                global_top_k=global_top_k,
+                min_candidates=global_min_candidates,
+            )
+            if keep_count > 0:
+                ordered_starts = sorted(
+                    (int(start) for start in starts),
+                    key=lambda start: float(local_advantages[start]),
+                    reverse=True,
+                )
+                for local_start in ordered_starts[:keep_count]:
+                    _mark_selected_chunk(
+                        positions=positions,
+                        local_start=local_start,
+                        chunk_size=chunk_size,
+                        role=SELECTION_GLOBAL_TOP,
+                        boundary_index=-1,
+                        chunk_start_indicator=chunk_start_indicator,
+                        chunk_start_role=chunk_start_role,
+                        indicator=indicator,
+                        weight=weight,
+                        selection_role=selection_role,
+                        boundary_id=boundary_id,
+                    )
+                    global_selected += 1
+            continue
 
         if include_boundary and boundary_top_k > 0:
             boundary_events: list[tuple[int, int]]
@@ -402,7 +471,7 @@ def mine_stage_chunks(
                     )
 
     intra_selected = 0
-    if include_intra_stage:
+    if stage_aware and include_intra_stage:
         for (episode_id, _task_idx, _stage_idx), candidates in intra_candidates.items():
             keep_count = _stage_keep_count(
                 num_candidates=len(candidates),
@@ -442,6 +511,12 @@ def mine_stage_chunks(
         "intra_candidate_groups": int(len(intra_candidates)),
         "intra_candidates": int(sum(len(items) for items in intra_candidates.values())),
         "intra_selected": int(intra_selected),
+        "global_candidates": int(global_candidate_count),
+        "global_selected": int(global_selected),
+        "global_top_ratio": float(global_top_ratio),
+        "global_top_k": int(global_top_k),
+        "selection_mode": "stage_aware" if stage_aware else "global_top",
+        "stage_aware": bool(stage_aware),
         "boundary_count": int(boundary_count),
         "boundary_candidates": int(boundary_candidate_count),
         "boundary_selected": int(np.sum(chunk_start_role == SELECTION_BOUNDARY_TRANSITION)),
@@ -449,7 +524,7 @@ def mine_stage_chunks(
         "success_episodes": int(success_episode_count),
         "failure_episodes": int(failure_episode_count),
         "failure_max_stage": int(failure_max_stage),
-        "intra_selection_scope": "episode_stage",
+        "intra_selection_scope": "episode_stage" if stage_aware else "episode_global",
         "stage_assignment": "success_first_reach_failure_raw_threshold",
         "value_smoothing_applied": False,
         "value_smoothing_window": int(value_smoothing_window),
