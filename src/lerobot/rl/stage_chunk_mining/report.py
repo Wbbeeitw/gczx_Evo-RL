@@ -82,6 +82,7 @@ def format_report_summary(report: dict[str, Any]) -> str:
         f"- intra_selected: {report.get('intra_selected', 0)}",
         f"- global_candidates: {report.get('global_candidates', 0)}",
         f"- global_selected: {report.get('global_selected', 0)}",
+        f"- global_selection_unit: {report.get('global_selection_unit', 'n/a')}",
         f"- intra_selection_scope: {report.get('intra_selection_scope', 'unknown')}",
         f"- stage_assignment: {report.get('stage_assignment', 'unknown')}",
         f"- value_smoothing_applied: {report.get('value_smoothing_applied', 'unknown')}",

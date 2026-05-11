@@ -172,6 +172,7 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
         global_top_ratio=cfg.mining.global_top_ratio,
         global_top_k=cfg.mining.global_top_k,
         global_min_candidates=cfg.mining.global_min_candidates,
+        global_nms_overlap_ratio=cfg.mining.global_nms_overlap_ratio,
         boundary_top_k=cfg.mining.boundary_top_k,
         boundary_nms_iou=cfg.mining.boundary_nms_iou,
         boundary_mode=cfg.mining.boundary_mode,
@@ -211,6 +212,8 @@ def run_stage_chunk_mining(cfg: StageChunkMinePipelineConfig) -> dict[str, Any]:
     report["stage_aware"] = bool(cfg.mining.stage_aware)
     report["global_top_ratio"] = float(cfg.mining.global_top_ratio)
     report["global_top_k"] = int(cfg.mining.global_top_k)
+    report["global_nms_metric"] = "overlap_ratio"
+    report["global_nms_overlap_ratio"] = float(cfg.mining.global_nms_overlap_ratio)
     report["indicator_field"] = f"{cfg.mining.output_prefix}.indicator"
     report["chunk_start_indicator_field"] = f"{cfg.mining.output_prefix}.chunk_start_indicator"
 

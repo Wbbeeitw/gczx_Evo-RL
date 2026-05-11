@@ -48,6 +48,7 @@ class StageChunkMiningConfig:
     global_top_ratio: float = 0.3
     global_top_k: int = 0
     global_min_candidates: int = 1
+    global_nms_overlap_ratio: float = 0.5
 
     boundary_top_k: int = 1
     boundary_nms_iou: float = 0.5
@@ -86,6 +87,8 @@ class StageChunkMiningConfig:
             raise ValueError("'mining.global_top_k' must be >= 0.")
         if self.global_min_candidates < 0:
             raise ValueError("'mining.global_min_candidates' must be >= 0.")
+        if not 0.0 <= self.global_nms_overlap_ratio <= 1.0:
+            raise ValueError("'mining.global_nms_overlap_ratio' must be within [0, 1].")
         if self.boundary_top_k < 0:
             raise ValueError("'mining.boundary_top_k' must be >= 0.")
         if not 0.0 <= self.boundary_nms_iou <= 1.0:

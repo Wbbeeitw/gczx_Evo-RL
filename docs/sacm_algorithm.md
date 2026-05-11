@@ -290,13 +290,16 @@ stage_top_ratio:
   每个 episode-stage 组内保留多少比例的 intra-stage 高优势 chunk。
 
 stage_aware:
-  是否启用阶段感知筛选。true 使用 SACM 当前的分阶段和边界逻辑；false 则关闭分阶段筛选，改成每条 episode 内全局滑窗 top-ratio 筛选。
+  是否启用阶段感知筛选。true 使用 SACM 当前的分阶段和边界逻辑；false 则关闭分阶段筛选，改成每条 episode 内全局滑窗筛选。
 
 global_top_ratio:
-  stage_aware=false 时，每条 episode 所有合法滑动窗口中保留前多少比例的高 advantage chunk。
+  stage_aware=false 且 global_top_k=0 时，目标帧覆盖率。系统会按 chunk advantage 从高到低加入 chunk，直到展开后的 indicator=1 帧覆盖率接近该比例。
 
 global_top_k:
   stage_aware=false 时，每条 episode 固定保留多少个全局最高 advantage chunk；如果大于 0，优先于 global_top_ratio。
+
+global_nms_overlap_ratio:
+  stage_aware=false 时，对全局候选 chunk 做一维 temporal NMS 的重叠率阈值。重叠率定义为 overlap / K。默认 0.5，用于抑制重叠超过半个 chunk 的重复窗口；设为 1.0 基本等价于关闭抑制。
 
 boundary_top_k:
   每个阶段边界附近保留几个最好的 boundary chunk。
@@ -829,13 +832,25 @@ failure episode 的阶段上升约束
 A_chunk(s)
 ```
 
-从高到低排序，然后保留：
+从高到低排序。排序后会先执行一维 temporal NMS：如果一个候选 chunk 与已经保留的高分 chunk 的时间重叠率超过 `global_nms_overlap_ratio`，则该候选会被抑制。重叠率定义为：
 
 ```text
-ceil(num_episode_chunks * global_top_ratio)
+overlap_ratio = overlap_length / K
 ```
 
-个 chunk。
+这样可以避免 50-99、51-100、52-101 这类几乎相同的滑窗反复占用筛选预算。
+
+当前实现中，`global_top_ratio` 表示目标帧覆盖率，而不是 chunk 起点比例。
+
+也就是说：
+
+```text
+global_top_ratio = 0.30
+```
+
+表示希望被选中 chunk 展开后的 `indicator=1` 帧覆盖率接近 30%。
+
+实现上会先按 advantage 排序并做 temporal NMS，然后在 NMS 后的候选里逐个加入 chunk，动态计算已选 chunk 的 union 覆盖帧数，选择使覆盖率最接近目标值的前 N 个 chunk。因此它不会精确等于目标覆盖率，但会避免因为 K 帧 chunk 大量重叠导致“选 30% chunk 起点，覆盖 80%+ 帧”的问题。
 
 如果设置：
 
@@ -843,7 +858,15 @@ ceil(num_episode_chunks * global_top_ratio)
 global_top_k > 0
 ```
 
-则每条 episode 固定保留 top-k 个全局最高 advantage chunk。
+则每条 episode 固定保留 top-k 个全局最高 advantage chunk，此时不使用覆盖率目标。
+
+默认：
+
+```text
+global_nms_overlap_ratio = 0.5
+```
+
+对于固定长度 `K=50` 的 chunk，连续起点如 `50-99` 与 `51-100` 的重叠率是 `49/50=0.98`，会被 NMS 抑制；`813-862` 与 `836-885` 的重叠率是 `27/50=0.54`，也会被抑制。只重叠很少帧、表达不同动作片段的 chunk 会继续保留。
 
 这个模式适合作为 baseline / ablation：它只验证“value-based chunk advantage 筛选”本身，不引入分阶段均衡和阶段边界偏置。
 
@@ -1031,7 +1054,10 @@ global_candidates:
   stage_aware=false 时参与全局排序的合法 chunk 起点数量。
 
 global_selected:
-  stage_aware=false 时被全局 top-ratio / top-k 选中的 chunk 起点数量。
+  stage_aware=false 时被全局覆盖率目标 / top-k 选中的 chunk 起点数量。
+
+global_selection_unit:
+  frame_coverage 表示 global_top_ratio 按目标帧覆盖率解释；chunk_count 表示使用 global_top_k 固定 chunk 数。
 ```
 
 最新实现后，训练标签密度主要看：
@@ -1396,7 +1422,7 @@ SACM 当前实现可以总结为：
 8. 用 GAE-style 的 TD error 累加计算 chunk advantage。
 9. 默认 stage_aware=true 时，阶段边界处保留 boundary_top_k 个优势 chunk。
 10. 默认 stage_aware=true 时，每个 episode-stage 内保留 top stage_top_ratio 的 intra-stage chunk。
-11. 可选 stage_aware=false 时，每条 episode 内全局保留 top global_top_ratio 的高优势 chunk。
+11. 可选 stage_aware=false 时，每条 episode 内按 advantage 排序选择 chunk，使帧级覆盖率接近 global_top_ratio。
 12. 把被选中 chunk 的 K 帧全部标为 indicator=1。
 13. 训练 policy 时把 indicator=1 转成 Advantage: positive。
 14. 把 indicator=0 转成 Advantage: negative。

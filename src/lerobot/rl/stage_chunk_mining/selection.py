@@ -110,19 +110,54 @@ def _stage_keep_count(num_candidates: int, stage_top_ratio: float, stage_top_k: 
     return min(num_candidates, max(min_candidates, int(ceil(num_candidates * stage_top_ratio))))
 
 
-def _global_keep_count(
-    num_candidates: int,
-    global_top_ratio: float,
+def _global_keep_count_by_coverage(
+    *,
+    ordered_starts: list[int],
+    episode_length: int,
+    chunk_size: int,
+    target_coverage_ratio: float,
     global_top_k: int,
     min_candidates: int,
 ) -> int:
+    num_candidates = len(ordered_starts)
     if num_candidates <= 0:
         return 0
     if global_top_k > 0:
         return min(global_top_k, num_candidates)
-    if global_top_ratio <= 0.0:
+    if target_coverage_ratio <= 0.0:
         return 0
-    return min(num_candidates, max(min_candidates, int(ceil(num_candidates * global_top_ratio))))
+
+    target_frames = float(target_coverage_ratio) * float(episode_length)
+    coverage = np.zeros(int(episode_length), dtype=np.bool_)
+    covered_frames = 0
+    best_count = 0
+    best_diff = float("inf")
+
+    for rank, local_start in enumerate(ordered_starts, start=1):
+        local_end = min(int(local_start) + int(chunk_size), int(episode_length))
+        if local_end <= int(local_start):
+            continue
+
+        window = coverage[int(local_start) : local_end]
+        newly_covered = int(np.sum(~window))
+        if newly_covered > 0:
+            coverage[int(local_start) : local_end] = True
+            covered_frames += newly_covered
+
+        if rank < min_candidates:
+            continue
+
+        diff = abs(float(covered_frames) - target_frames)
+        if diff < best_diff:
+            best_diff = diff
+            best_count = rank
+
+        if covered_frames >= target_frames:
+            break
+
+    if best_count <= 0 and min_candidates > 0:
+        return min(num_candidates, min_candidates)
+    return min(num_candidates, best_count)
 
 
 def _episode_success_value(episode_success: dict[int, bool] | np.ndarray | None, episode_id: int) -> bool:
@@ -239,6 +274,7 @@ def mine_stage_chunks(
     global_top_ratio: float = 0.3,
     global_top_k: int = 0,
     global_min_candidates: int = 1,
+    global_nms_overlap_ratio: float = 0.5,
     boundary_top_k: int = 1,
     boundary_nms_iou: float = 0.5,
     boundary_mode: str = "unique_stage_boundary",
@@ -288,8 +324,11 @@ def mine_stage_chunks(
         raise ValueError("'global_top_k' must be >= 0.")
     if global_min_candidates < 0:
         raise ValueError("'global_min_candidates' must be >= 0.")
+    if not 0.0 <= global_nms_overlap_ratio <= 1.0:
+        raise ValueError("'global_nms_overlap_ratio' must be within [0, 1].")
 
     global_candidate_count = 0
+    global_nms_candidate_count = 0
     global_selected = 0
 
     for episode_id, ep_slice in iter_episode_slices(episode_indices):
@@ -378,18 +417,26 @@ def mine_stage_chunks(
                 dtype=np.int64,
             )
             global_candidate_count += int(starts.size)
-            keep_count = _global_keep_count(
-                num_candidates=int(starts.size),
-                global_top_ratio=global_top_ratio,
+            kept_indices = temporal_nms(
+                starts=starts,
+                scores=local_advantages[starts],
+                length=chunk_size,
+                threshold=global_nms_overlap_ratio,
+                top_k=0,
+                metric="overlap_ratio",
+            )
+            nms_starts = starts[kept_indices]
+            global_nms_candidate_count += int(nms_starts.size)
+            ordered_starts = [int(start) for start in nms_starts]
+            keep_count = _global_keep_count_by_coverage(
+                ordered_starts=ordered_starts,
+                episode_length=episode_length,
+                chunk_size=chunk_size,
+                target_coverage_ratio=global_top_ratio,
                 global_top_k=global_top_k,
                 min_candidates=global_min_candidates,
             )
             if keep_count > 0:
-                ordered_starts = sorted(
-                    (int(start) for start in starts),
-                    key=lambda start: float(local_advantages[start]),
-                    reverse=True,
-                )
                 for local_start in ordered_starts[:keep_count]:
                     _mark_selected_chunk(
                         positions=positions,
@@ -451,8 +498,9 @@ def mine_stage_chunks(
                     starts=starts,
                     scores=scores,
                     length=chunk_size,
-                    iou_threshold=boundary_nms_iou,
+                    threshold=boundary_nms_iou,
                     top_k=boundary_top_k,
+                    metric="iou",
                 )
                 for kept_idx in kept_local_indices:
                     local_start = int(starts[kept_idx])
@@ -512,9 +560,14 @@ def mine_stage_chunks(
         "intra_candidates": int(sum(len(items) for items in intra_candidates.values())),
         "intra_selected": int(intra_selected),
         "global_candidates": int(global_candidate_count),
+        "global_nms_candidates": int(global_nms_candidate_count),
+        "global_nms_suppressed": int(global_candidate_count - global_nms_candidate_count),
         "global_selected": int(global_selected),
         "global_top_ratio": float(global_top_ratio),
         "global_top_k": int(global_top_k),
+        "global_nms_metric": "overlap_ratio",
+        "global_nms_overlap_ratio": float(global_nms_overlap_ratio),
+        "global_selection_unit": "frame_coverage" if not stage_aware and global_top_k == 0 else "chunk_count",
         "selection_mode": "stage_aware" if stage_aware else "global_top",
         "stage_aware": bool(stage_aware),
         "boundary_count": int(boundary_count),

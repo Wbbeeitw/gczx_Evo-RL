@@ -66,10 +66,57 @@ class TestStageChunkMining(unittest.TestCase):
         selected_starts = set(int(v) for v in np.flatnonzero(result.chunk_start_indicator))
         self.assertEqual(selected_starts, {0, 2})
         self.assertEqual(result.report["selection_mode"], "global_top")
+        self.assertEqual(result.report["global_selection_unit"], "frame_coverage")
         self.assertEqual(result.report["global_candidates"], 5)
         self.assertEqual(result.report["global_selected"], 2)
         self.assertEqual(int(np.sum(result.chunk_start_role == SELECTION_GLOBAL_TOP)), 2)
         self.assertEqual(int(np.sum(result.chunk_start_role == SELECTION_BOUNDARY_TRANSITION)), 0)
+
+    def test_global_top_ratio_targets_frame_coverage_not_chunk_count(self):
+        values = np.asarray([-0.9, -0.7, -0.5, -0.3, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            num_stages=5,
+            chunk_size=4,
+            value_normalization="clip",
+            stage_aware=False,
+            global_top_ratio=0.5,
+            global_nms_overlap_ratio=1.0,
+        )
+        self.assertEqual(result.report["global_candidates"], 6)
+        self.assertEqual(result.report["global_nms_candidates"], 6)
+        self.assertEqual(result.report["global_selected"], 2)
+        self.assertEqual(int(np.sum(result.indicator)), 5)
+        np.testing.assert_array_equal(
+            result.chunk_start_indicator, np.asarray([1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+        )
+
+    def test_global_top_temporal_nms_suppresses_overlapping_windows(self):
+        values = np.asarray([-0.9, -0.7, -0.5, -0.3, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1], dtype=np.float32)
+        result = mine_stage_chunks(
+            values=values,
+            episode_indices=np.zeros(values.shape[0], dtype=np.int64),
+            frame_indices=np.arange(values.shape[0], dtype=np.int64),
+            task_indices=np.zeros(values.shape[0], dtype=np.int64),
+            l_max_by_task={0: 100},
+            num_stages=5,
+            chunk_size=4,
+            value_normalization="clip",
+            stage_aware=False,
+            global_top_k=3,
+            global_nms_overlap_ratio=0.5,
+        )
+        selected_starts = np.flatnonzero(result.chunk_start_indicator)
+        self.assertEqual(result.report["global_candidates"], 6)
+        self.assertLess(result.report["global_nms_candidates"], result.report["global_candidates"])
+        self.assertEqual(result.report["global_nms_metric"], "overlap_ratio")
+        self.assertEqual(result.report["global_nms_overlap_ratio"], 0.5)
+        self.assertFalse({1, 3}.intersection(set(int(v) for v in selected_starts)))
+        self.assertTrue(np.all(np.diff(selected_starts) >= 2))
 
     def test_global_top_selection_marks_all_frames_inside_selected_chunk(self):
         values = np.asarray([-0.9, -0.8, -0.7, -0.72, -0.74], dtype=np.float32)
