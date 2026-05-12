@@ -12,6 +12,7 @@ import torch
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
+from torch.utils.data._utils.collate import default_collate
 
 from lerobot.configs import parser
 from lerobot.configs.value_train import ValueTrainPipelineConfig
@@ -30,6 +31,7 @@ from lerobot.utils.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.utils.constants import OBS_IMAGES
 from lerobot.utils.utils import format_big_number, has_method, init_logging
 
 
@@ -42,6 +44,71 @@ def _processor_config_has_step(pretrained_path: str | Path | None, config_name: 
     with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
     return any(step.get("registry_name") == step_name for step in config.get("steps", []))
+
+
+def _required_value_batch_keys(cfg: ValueTrainPipelineConfig) -> set[str]:
+    required_keys = {"index"}
+
+    task_field = getattr(cfg.value, "task_field", None)
+    if isinstance(task_field, str) and task_field:
+        required_keys.add(task_field)
+
+    state_feature = getattr(cfg.value, "state_feature", None)
+    if isinstance(state_feature, str) and state_feature:
+        required_keys.add(state_feature)
+
+    camera_features = list(getattr(cfg.value, "camera_features", []) or [])
+    if not camera_features:
+        input_features = getattr(cfg.value, "input_features", None) or {}
+        camera_features = [key for key in input_features if key.startswith(OBS_IMAGES)]
+    required_keys.update(camera_features)
+
+    return required_keys
+
+
+def _make_value_collate_fn(required_keys: set[str]):
+    warned_optional_keys: set[str] = set()
+
+    def value_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(batch) == 0:
+            return {}
+
+        collated: dict[str, Any] = {}
+        shared_keys = set(batch[0])
+        for item in batch[1:]:
+            shared_keys &= set(item)
+
+        missing_required = sorted(key for key in required_keys if key not in shared_keys)
+        if missing_required:
+            raise KeyError(f"Missing required batch keys during collation: {missing_required}")
+
+        for key in sorted(shared_keys):
+            values = [item[key] for item in batch]
+            if any(value is None for value in values):
+                if key in required_keys:
+                    raise ValueError(f"Required batch key '{key}' contains None values.")
+                if key not in warned_optional_keys:
+                    logging.warning("Dropping optional batch key '%s' because it contains None values.", key)
+                    warned_optional_keys.add(key)
+                continue
+
+            try:
+                collated[key] = default_collate(values)
+            except Exception as exc:
+                if key in required_keys:
+                    raise RuntimeError(f"Failed to collate required batch key '{key}'.") from exc
+                if key not in warned_optional_keys:
+                    logging.warning(
+                        "Dropping optional batch key '%s' because collation failed: %s: %s",
+                        key,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    warned_optional_keys.add(key)
+
+        return collated
+
+    return value_collate_fn
 
 
 def update_policy(
@@ -213,6 +280,10 @@ def value_train(
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    required_batch_keys = _required_value_batch_keys(cfg)
+    if is_main_process:
+        logging.info("Value-train collate required keys: %s", sorted(required_batch_keys))
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -222,6 +293,7 @@ def value_train(
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
+        collate_fn=_make_value_collate_fn(required_batch_keys),
     )
 
     accelerator.wait_for_everyone()
