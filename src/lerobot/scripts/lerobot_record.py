@@ -63,6 +63,7 @@ lerobot-record \
 """
 
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -131,6 +132,8 @@ from lerobot.utils.control_utils import (
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.recording_annotations import (
+    EPISODE_FAILURE,
+    EPISODE_SUCCESS,
     infer_collector_policy_id,
     normalize_episode_success_label,
     resolve_episode_success_label,
@@ -233,6 +236,16 @@ class RecordConfig:
     collector_policy_id_policy: str | None = None
     # Policy identifier used when action source is human/teleop.
     collector_policy_id_human: str = "human"
+    # If enabled, pressing the success/failure key sends an action-space center command before reset.
+    reset_to_center_on_episode_outcome: bool = False
+    # How long to keep commanding the action-space center pose after success/failure.
+    reset_to_center_duration_s: float = 6.0
+    # Command rate used while returning to center.
+    reset_to_center_control_hz: float = 20.0
+    # Include gripper `.pos` action keys after arm joints have returned to center.
+    reset_to_center_include_gripper: bool = True
+    # How long to keep commanding gripper center after the arm joints have returned.
+    reset_to_center_gripper_duration_s: float = 2.0
     # ACP inference controls for policy-driven recording.
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
     # Retry timeout for transient communication errors (seconds). Set to 0 to fail immediately.
@@ -284,6 +297,17 @@ class RecordConfig:
             raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
         if self.acp_inference.cfg_beta < 0:
             raise ValueError("`acp_inference.cfg_beta` must be >= 0.")
+        if self.reset_to_center_on_episode_outcome and not self.enable_episode_outcome_labeling:
+            raise ValueError(
+                "`reset_to_center_on_episode_outcome=true` requires "
+                "`enable_episode_outcome_labeling=true` so success/failure keys are active."
+            )
+        if self.reset_to_center_duration_s < 0:
+            raise ValueError("`reset_to_center_duration_s` must be >= 0.")
+        if self.reset_to_center_gripper_duration_s < 0:
+            raise ValueError("`reset_to_center_gripper_duration_s` must be >= 0.")
+        if self.reset_to_center_control_hz <= 0:
+            raise ValueError("`reset_to_center_control_hz` must be > 0.")
         if self.communication_retry_timeout_s < 0:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
@@ -316,6 +340,143 @@ def _ensure_human_inloop_compatible_features(
         "shape": (1,),
         "names": ["state"],
     }
+
+
+def _build_action_space_center_command(
+    robot,
+    *,
+    include_gripper: bool = False,
+    gripper_only: bool = False,
+) -> dict[str, float]:
+    action_keys = list(robot.action_features)
+    center_action = {}
+    for key in action_keys:
+        if not key.endswith(".pos"):
+            continue
+        is_gripper = "gripper" in key
+        if gripper_only and not is_gripper:
+            continue
+        if not gripper_only and is_gripper and not include_gripper:
+            continue
+        center_action[key] = 0.0
+    return center_action
+
+
+def _split_prefixed_piper_action_key(robot, key: str):
+    if key.startswith("left_") and hasattr(robot, "left_arm"):
+        return robot.left_arm, key.removeprefix("left_")
+    if key.startswith("right_") and hasattr(robot, "right_arm"):
+        return robot.right_arm, key.removeprefix("right_")
+    return robot, key
+
+
+def _calibration_home_deg(arm, key: str) -> float | None:
+    calibration = getattr(arm, "calibration", None)
+    if not calibration or key not in calibration:
+        return None
+
+    cal = calibration[key]
+    from_units = getattr(arm, "_from_calibration_units", None)
+    if callable(from_units):
+        return float(from_units(cal.homing_offset))
+
+    config = getattr(arm, "config", None)
+    calibration_scale = float(getattr(config, "calibration_scale", 1000))
+    return float(cal.homing_offset) / calibration_scale
+
+
+def _estimate_current_action_offsets(robot, action_keys: list[str]) -> dict[str, float]:
+    get_observation = getattr(robot, "get_observation", None)
+    if not callable(get_observation):
+        return {}
+
+    observation = get_observation()
+    offsets: dict[str, float] = {}
+    for action_key in action_keys:
+        if action_key not in observation:
+            continue
+        arm, arm_key = _split_prefixed_piper_action_key(robot, action_key)
+        home_deg = _calibration_home_deg(arm, arm_key)
+        if home_deg is None:
+            continue
+        current_deg = float(observation[action_key])
+        cal = getattr(arm, "calibration", {}).get(arm_key)
+        offset_deg = current_deg - home_deg
+        if getattr(cal, "drive_mode", 0):
+            offset_deg = -offset_deg
+        offsets[action_key] = offset_deg
+    return offsets
+
+
+def _send_center_command_for_duration(
+    robot,
+    center_action: dict[str, float],
+    *,
+    duration_s: float,
+    control_hz: float,
+    description: str,
+) -> None:
+    if not center_action:
+        logging.warning("No '.pos' action keys available for %s reset-to-center command.", description)
+        return
+
+    action_keys = list(center_action)
+    start_offsets = _estimate_current_action_offsets(robot, action_keys) if duration_s > 0 else {}
+    steps = max(1, int(round(duration_s * control_hz)))
+    sleep_s = 1.0 / control_hz if duration_s > 0 else 0.0
+    logging.info(
+        "Returning %s to action-space center for %.2fs at %.1fHz (%d keys, ramped_keys=%d).",
+        description,
+        duration_s,
+        control_hz,
+        len(center_action),
+        len(start_offsets),
+    )
+
+    for step_idx in range(steps):
+        if start_offsets:
+            alpha = float(step_idx + 1) / float(steps)
+            action = {
+                key: float(start_offsets.get(key, center_action[key])) * (1.0 - alpha)
+                for key in action_keys
+            }
+        else:
+            action = center_action
+        robot.send_action(action)
+        if sleep_s > 0 and step_idx < steps - 1:
+            time.sleep(sleep_s)
+
+
+def _return_to_action_space_center(
+    robot,
+    *,
+    duration_s: float,
+    control_hz: float,
+    include_gripper: bool = True,
+    gripper_duration_s: float = 2.0,
+) -> None:
+    arm_center_action = _build_action_space_center_command(robot, include_gripper=False)
+    _send_center_command_for_duration(
+        robot,
+        arm_center_action,
+        duration_s=duration_s,
+        control_hz=control_hz,
+        description="arm joints",
+    )
+
+    if include_gripper:
+        gripper_center_action = _build_action_space_center_command(
+            robot,
+            include_gripper=True,
+            gripper_only=True,
+        )
+        _send_center_command_for_duration(
+            robot,
+            gripper_center_action,
+            duration_s=gripper_duration_s,
+            control_hz=control_hz,
+            description="grippers",
+        )
 
 
 @parser.wrap()
@@ -479,10 +640,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                 )
 
+                explicit_episode_outcome = events.get("episode_outcome")
                 episode_success = None
                 if cfg.enable_episode_outcome_labeling:
                     episode_success = resolve_episode_success_label(
-                        explicit_label=events.get("episode_outcome"),
+                        explicit_label=explicit_episode_outcome,
                         default_label=cfg.default_episode_success,
                         require_label=cfg.require_episode_success_label,
                     )
@@ -496,6 +658,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 on_episode_outcome = getattr(cfg, "_on_record_episode_outcome", None)
                 if callable(on_episode_outcome):
                     on_episode_outcome(robot, teleop, episode_success)
+
+                if (
+                    cfg.reset_to_center_on_episode_outcome
+                    and explicit_episode_outcome in {EPISODE_SUCCESS, EPISODE_FAILURE}
+                ):
+                    _return_to_action_space_center(
+                        robot,
+                        duration_s=cfg.reset_to_center_duration_s,
+                        control_hz=cfg.reset_to_center_control_hz,
+                        include_gripper=cfg.reset_to_center_include_gripper,
+                        gripper_duration_s=cfg.reset_to_center_gripper_duration_s,
+                    )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded

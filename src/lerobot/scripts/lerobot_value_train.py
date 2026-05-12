@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 
+import json
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -29,6 +31,17 @@ from lerobot.utils.train_utils import (
     update_last_checkpoint,
 )
 from lerobot.utils.utils import format_big_number, has_method, init_logging
+
+
+def _processor_config_has_step(pretrained_path: str | Path | None, config_name: str, step_name: str) -> bool:
+    if pretrained_path is None:
+        return False
+    config_path = Path(pretrained_path) / config_name
+    if not config_path.is_file():
+        return False
+    with open(config_path, encoding="utf-8") as f:
+        config = json.load(f)
+    return any(step.get("registry_name") == step_name for step in config.get("steps", []))
 
 
 def update_policy(
@@ -156,13 +169,18 @@ def value_train(
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
         }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": cfg.value.output_features or {},
-                "norm_map": cfg.value.normalization_mapping,
-            },
-        }
+        if _processor_config_has_step(
+            cfg.value.pretrained_path,
+            "policy_postprocessor.json",
+            "unnormalizer_processor",
+        ):
+            postprocessor_kwargs["postprocessor_overrides"] = {
+                "unnormalizer_processor": {
+                    "stats": dataset.meta.stats,
+                    "features": cfg.value.output_features or {},
+                    "norm_map": cfg.value.normalization_mapping,
+                },
+            }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.value,
