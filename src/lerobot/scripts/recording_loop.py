@@ -84,6 +84,31 @@ T = TypeVar("T")
 """
 
 
+def _toggle_manual_intervention_annotation(active: bool) -> tuple[bool, float]:
+    """Flip manual intervention annotation state and map it to HIL-compatible state ids."""
+    active = not active
+    state = INTERVENTION_STATE_ACTIVE if active else INTERVENTION_STATE_POLICY
+    return active, state
+
+
+def _resolve_intervention_annotation(
+    *,
+    intervention_enabled: bool,
+    intervention_state: float,
+    manual_intervention_active: bool,
+) -> tuple[float, float]:
+    """Resolve per-frame intervention annotation and stored state value."""
+    if intervention_enabled:
+        return (
+            (1.0, INTERVENTION_STATE_ACTIVE)
+            if intervention_state == INTERVENTION_STATE_ACTIVE
+            else (0.0, intervention_state)
+        )
+    if manual_intervention_active:
+        return 1.0, INTERVENTION_STATE_ACTIVE
+    return 0.0, INTERVENTION_STATE_POLICY
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -109,6 +134,8 @@ def record_loop(
     display_compressed_images: bool = False,
     policy_sync_executor: PolicySyncDualArmExecutor | None = None,
     intervention_state_machine_enabled: bool = True,
+    manual_intervention_annotation_enabled: bool = False,
+    intervention_toggle_key: str = "i",
     collector_policy_id_policy: str = "policy",
     collector_policy_id_human: str = "human",
     acp_inference: ACPInferenceConfig | None = None,
@@ -158,7 +185,11 @@ def record_loop(
     zero_policy_action = dict.fromkeys(action_feature_names, 0.0)
     has_teleop = isinstance(teleop, (Teleoperator, list))
     intervention_enabled = intervention_state_machine_enabled and policy is not None and has_teleop
+    manual_intervention_annotation_armed = (
+        manual_intervention_annotation_enabled and has_teleop and not intervention_enabled
+    )
     intervention_state = INTERVENTION_STATE_POLICY
+    manual_intervention_active = False
     last_teleop_action: RobotAction | None = None
     teleop_fallback_warned = False
 
@@ -197,6 +228,12 @@ def record_loop(
     if intervention_enabled:
         # Start in S0: policy drives both arms, teleop arm should accept feedback commands.
         set_teleop_manual_control(False)
+    elif manual_intervention_annotation_armed and dataset is not None:
+        logging.info(
+            "Manual intervention annotation is enabled for this episode. "
+            "Press '%s' to toggle complementary_info.is_intervention on/off.",
+            intervention_toggle_key,
+        )
 
     def run_with_connection_retry(action_name: str, fn: Callable[[], T]) -> T:
         timeout_s = max(communication_retry_timeout_s, 0.0)
@@ -267,6 +304,22 @@ def record_loop(
                     if policy is not None and preprocessor is not None and postprocessor is not None:
                         logging.info("Policy cache reset on release: next policy action is recomputed.")
                     logging.info("Intervention release requested (S2): returning control to policy.")
+            elif manual_intervention_annotation_armed:
+                if dataset is None:
+                    logging.info(
+                        "Manual intervention annotation toggle ignored during reset loop because frames are not being recorded."
+                    )
+                else:
+                    manual_intervention_active, intervention_state = _toggle_manual_intervention_annotation(
+                        manual_intervention_active
+                    )
+                    logging.info(
+                        "Manual intervention annotation %s at t=%.3fs: complementary_info.is_intervention=%d until next '%s' press.",
+                        "enabled" if manual_intervention_active else "disabled",
+                        time.perf_counter() - start_episode_t,
+                        1 if manual_intervention_active else 0,
+                        intervention_toggle_key,
+                    )
             else:
                 logging.info("Intervention toggle ignored because policy+teleop are not both active.")
 
@@ -333,9 +386,12 @@ def record_loop(
             act_processed_policy if act_processed_policy is not None else zero_policy_action
         )
 
-        is_intervention = 0.0
+        is_intervention, annotation_state = _resolve_intervention_annotation(
+            intervention_enabled=intervention_enabled,
+            intervention_state=intervention_state,
+            manual_intervention_active=manual_intervention_active,
+        )
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
-            is_intervention = 1.0
             if act_processed_teleop is not None:
                 action_values = act_processed_teleop
             elif last_teleop_action is not None:
@@ -394,7 +450,7 @@ def record_loop(
             if "complementary_info.is_intervention" in dataset.features:
                 frame["complementary_info.is_intervention"] = np.array([is_intervention], dtype=np.float32)
             if "complementary_info.state" in dataset.features:
-                frame["complementary_info.state"] = np.array([intervention_state], dtype=np.float32)
+                frame["complementary_info.state"] = np.array([annotation_state], dtype=np.float32)
             if "complementary_info.collector_policy_id" in dataset.features:
                 frame["complementary_info.collector_policy_id"] = resolve_collector_policy_id(
                     intervention_enabled=intervention_enabled,

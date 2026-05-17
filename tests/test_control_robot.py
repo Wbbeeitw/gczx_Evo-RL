@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import json
+import logging
 from collections import deque
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,9 @@ import torch
 
 from lerobot.datasets.dataset_tools import merge_datasets, remove_feature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.utils import combine_feature_dicts
+from lerobot.processor import make_default_processors
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_human_inloop_record import (
     _HumanInloopFailureResetController,
@@ -38,6 +42,7 @@ from lerobot.scripts.lerobot_record import (
     DatasetRecordConfig,
     PolicySyncDualArmExecutor,
     RecordConfig,
+    _ensure_human_inloop_compatible_features,
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
     record,
@@ -285,6 +290,98 @@ def test_record_loop_sets_leader_manual_control_during_reset():
     assert teleop.manual_control_calls == [True]
 
 
+def test_record_loop_manual_intervention_annotation_toggle_marks_frames_and_logs(tmp_path, caplog):
+    class _ToggleMockRobot(MockRobot):
+        def __init__(self, config, events):
+            super().__init__(config)
+            self._events = events
+            self._observation_calls = 0
+
+        def get_observation(self):
+            observation = super().get_observation()
+            self._observation_calls += 1
+            if self._observation_calls in {2, 3}:
+                self._events["toggle_intervention"] = True
+            if self._observation_calls >= 4:
+                self._events["exit_early"] = True
+            return observation
+
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "toggle_intervention": True,
+        "episode_outcome": None,
+    }
+    robot = _ToggleMockRobot(
+        MockRobotConfig(n_motors=3, random_values=False, static_values=[0.0, 0.0, 0.0]),
+        events,
+    )
+    teleop = MockTeleop(MockTeleopConfig(n_motors=3, random_values=False, static_values=[1.0, 2.0, 3.0]))
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    dataset_features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=teleop_action_processor,
+            initial_features=create_initial_features(action=robot.action_features),
+            use_videos=False,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=False,
+        ),
+    )
+    _ensure_human_inloop_compatible_features(
+        dataset_features,
+        action_feature_names=list(robot.action_features),
+    )
+    dataset_root = tmp_path / "manual_intervention_annotation"
+    dataset = LeRobotDataset.create(
+        DUMMY_REPO_ID,
+        fps=30,
+        root=dataset_root,
+        robot_type=robot.name,
+        features=dataset_features,
+        use_videos=False,
+    )
+
+    robot.connect()
+    teleop.connect()
+    try:
+        with caplog.at_level(logging.INFO):
+            record_loop(
+                robot=robot,
+                events=events,
+                fps=30,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                dataset=dataset,
+                teleop=teleop,
+                control_time_s=1.0,
+                single_task="Dummy task",
+                manual_intervention_annotation_enabled=True,
+                intervention_toggle_key="g",
+            )
+        dataset.save_episode()
+        dataset.finalize()
+    finally:
+        if teleop.is_connected:
+            teleop.disconnect()
+        if robot.is_connected:
+            robot.disconnect()
+
+    reloaded = LeRobotDataset(DUMMY_REPO_ID, root=dataset_root)
+    intervention_flags = [float(reloaded[i]["complementary_info.is_intervention"]) for i in range(reloaded.num_frames)]
+    intervention_states = [float(reloaded[i]["complementary_info.state"]) for i in range(reloaded.num_frames)]
+
+    assert intervention_flags == [1.0, 1.0, 0.0, 1.0]
+    assert intervention_states == [1.0, 1.0, 0.0, 1.0]
+    assert "Manual intervention annotation enabled" in caplog.text
+    assert "Manual intervention annotation disabled" in caplog.text
+
+
 def test_save_and_load_failure_reset_pose(tmp_path):
     robot = MockRobot(MockRobotConfig(n_motors=2, random_values=False, static_values=[12.5, -3.0]))
     robot.connect()
@@ -502,6 +599,50 @@ def test_record_config_rejects_negative_cfg_beta():
             teleop=teleop_cfg,
             play_sounds=False,
             acp_inference=ACPInferenceConfig(enable=True, use_cfg=False, cfg_beta=-0.1),
+        )
+
+
+def test_record_config_rejects_manual_intervention_annotation_without_teleop():
+    robot_cfg = MockRobotConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+
+    with pytest.raises(ValueError, match="requires `teleop` to be set"):
+        RecordConfig(
+            robot=robot_cfg,
+            dataset=dataset_cfg,
+            policy=MagicMock(),
+            play_sounds=False,
+            manual_intervention_annotation_enabled=True,
+        )
+
+
+def test_record_config_rejects_manual_intervention_annotation_with_policy():
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+
+    with pytest.raises(ValueError, match="only supported for teleop-only recording"):
+        RecordConfig(
+            robot=robot_cfg,
+            dataset=dataset_cfg,
+            teleop=teleop_cfg,
+            policy=MagicMock(),
+            play_sounds=False,
+            manual_intervention_annotation_enabled=True,
         )
 
 

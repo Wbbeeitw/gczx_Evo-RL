@@ -218,6 +218,9 @@ class RecordConfig:
     policy_sync_parallel: bool = True
     # Enable S0/S1/S2 intervention state machine when policy + teleop are both available.
     intervention_state_machine_enabled: bool = True
+    # In teleop-only recording, reuse `intervention_toggle_key` as a manual intervention-annotation toggle.
+    # While enabled, `complementary_info.is_intervention` stays at 1 until the next toggle.
+    manual_intervention_annotation_enabled: bool = False
     # Keyboard key used to toggle entering/leaving intervention.
     intervention_toggle_key: str = "i"
     # Whether to capture episode-level success/failure labels from keyboard.
@@ -266,6 +269,13 @@ class RecordConfig:
         if self.teleop is None and self.policy is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
         sanity_check_bimanual_piper_pair(self.robot, self.teleop)
+        if self.manual_intervention_annotation_enabled:
+            if self.teleop is None:
+                raise ValueError("`manual_intervention_annotation_enabled=true` requires `teleop` to be set.")
+            if self.policy is not None:
+                raise ValueError(
+                    "`manual_intervention_annotation_enabled=true` is only supported for teleop-only recording."
+                )
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
 
@@ -609,6 +619,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             episode_success_key=cfg.episode_success_key if cfg.enable_episode_outcome_labeling else None,
             episode_failure_key=cfg.episode_failure_key if cfg.enable_episode_outcome_labeling else None,
         )
+        if cfg.manual_intervention_annotation_enabled:
+            logging.info(
+                "Manual intervention annotation is enabled. Press '%s' to toggle complementary_info.is_intervention "
+                "between 0 and 1 during recorded episode frames.",
+                cfg.intervention_toggle_key,
+            )
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
@@ -633,6 +649,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                     policy_sync_executor=policy_sync_executor,
                     intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
+                    manual_intervention_annotation_enabled=cfg.manual_intervention_annotation_enabled,
+                    intervention_toggle_key=cfg.intervention_toggle_key,
                     collector_policy_id_policy=collector_policy_id_policy,
                     collector_policy_id_human=collector_policy_id_human,
                     acp_inference=cfg.acp_inference,
@@ -695,6 +713,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_data=cfg.display_data,
                         policy_sync_executor=policy_sync_executor,
                         intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
+                        manual_intervention_annotation_enabled=cfg.manual_intervention_annotation_enabled,
+                        intervention_toggle_key=cfg.intervention_toggle_key,
                         collector_policy_id_policy=collector_policy_id_policy,
                         collector_policy_id_human=collector_policy_id_human,
                         acp_inference=cfg.acp_inference,
