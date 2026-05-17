@@ -642,7 +642,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 explicit_episode_outcome = events.get("episode_outcome")
                 episode_success = None
-                if cfg.enable_episode_outcome_labeling:
+                if cfg.enable_episode_outcome_labeling and not events["rerecord_episode"]:
                     episode_success = resolve_episode_success_label(
                         explicit_label=explicit_episode_outcome,
                         default_label=cfg.default_episode_success,
@@ -656,7 +656,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         )
 
                 on_episode_outcome = getattr(cfg, "_on_record_episode_outcome", None)
-                if callable(on_episode_outcome):
+                if callable(on_episode_outcome) and not events["rerecord_episode"]:
                     on_episode_outcome(robot, teleop, episode_success)
 
                 if (

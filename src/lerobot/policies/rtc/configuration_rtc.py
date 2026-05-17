@@ -42,6 +42,7 @@ class RTCConfig:
     prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
     max_guidance_weight: float = 10.0
     execution_horizon: int = 10
+    queue_blend_steps: int = 0
 
     # Debug settings
     debug: bool = False
@@ -51,5 +52,7 @@ class RTCConfig:
         """Validate RTC configuration parameters."""
         if self.max_guidance_weight <= 0:
             raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
+        if self.queue_blend_steps < 0:
+            raise ValueError(f"queue_blend_steps must be non-negative, got {self.queue_blend_steps}")
         if self.debug_maxlen <= 0:
             raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")

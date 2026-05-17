@@ -63,6 +63,10 @@ class ActionQueue:
         self.lock = Lock()
         self.last_index = 0
         self.cfg = cfg
+        self.last_blend_steps = 0
+        self.last_replace_old_remaining = 0
+        self.last_replace_new_length = 0
+        self.last_replace_real_delay = 0
 
     def get(self) -> Tensor | None:
         """Get the next action from the queue.
@@ -164,14 +168,70 @@ class ActionQueue:
             processed_actions: Post-processed actions for robot.
             real_delay: Number of time steps to skip due to inference delay.
         """
-        self.original_queue = original_actions[real_delay:].clone()
-        self.queue = processed_actions[real_delay:].clone()
+        old_original_remaining = None
+        old_processed_remaining = None
+        if self.original_queue is not None and self.last_index < len(self.original_queue):
+            old_original_remaining = self.original_queue[self.last_index :].clone()
+        if self.queue is not None and self.last_index < len(self.queue):
+            old_processed_remaining = self.queue[self.last_index :].clone()
+
+        new_original_queue = original_actions[real_delay:].clone()
+        new_processed_queue = processed_actions[real_delay:].clone()
+
+        self.last_replace_old_remaining = 0 if old_processed_remaining is None else len(old_processed_remaining)
+        self.last_replace_new_length = len(new_processed_queue)
+        self.last_replace_real_delay = real_delay
+        self.last_blend_steps = 0
+
+        blend_steps = self._get_blend_steps(old_processed_remaining, new_processed_queue)
+        if blend_steps > 0:
+            new_original_queue = self._blend_prefix(
+                old_original_remaining,
+                new_original_queue,
+                blend_steps,
+            )
+            new_processed_queue = self._blend_prefix(
+                old_processed_remaining,
+                new_processed_queue,
+                blend_steps,
+            )
+            self.last_blend_steps = blend_steps
+
+        self.original_queue = new_original_queue
+        self.queue = new_processed_queue
 
         logger.debug(f"original_actions shape: {self.original_queue.shape}")
         logger.debug(f"processed_actions shape: {self.queue.shape}")
         logger.debug(f"real_delay: {real_delay}")
 
         self.last_index = 0
+
+    def _get_blend_steps(self, old_processed_remaining: Tensor | None, new_processed_queue: Tensor) -> int:
+        """Compute how many prefix actions should be blended during replacement."""
+        if self.cfg.queue_blend_steps <= 0:
+            return 0
+
+        old_len = 0 if old_processed_remaining is None else len(old_processed_remaining)
+        new_len = len(new_processed_queue)
+        return min(self.cfg.queue_blend_steps, old_len, new_len)
+
+    def _blend_prefix(self, old_actions: Tensor | None, new_actions: Tensor, blend_steps: int) -> Tensor:
+        """Blend the first few actions to soften chunk boundary discontinuities."""
+        if old_actions is None or blend_steps <= 0:
+            return new_actions
+
+        blended_actions = new_actions.clone()
+        weights = torch.arange(
+            1,
+            blend_steps + 1,
+            device=new_actions.device,
+            dtype=new_actions.dtype,
+        ) / float(blend_steps + 1)
+        weights = weights.view(-1, *([1] * (new_actions.ndim - 1)))
+        old_prefix = old_actions[:blend_steps].to(device=new_actions.device, dtype=new_actions.dtype)
+
+        blended_actions[:blend_steps] = old_prefix * (1 - weights) + blended_actions[:blend_steps] * weights
+        return blended_actions
 
     def _append_actions_queue(self, original_actions: Tensor, processed_actions: Tensor):
         """Append new actions to the queue (non-RTC mode).

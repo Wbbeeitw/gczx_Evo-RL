@@ -336,6 +336,67 @@ def test_merge_with_large_delay(action_queue_rtc_enabled, sample_actions):
     assert action_queue_rtc_enabled.qsize() == 0
 
 
+def test_merge_blends_prefix_when_queue_blend_steps_enabled():
+    """Test RTC replacement blends the prefix instead of hard-switching chunks."""
+    cfg = RTCConfig(enabled=True, execution_horizon=10, queue_blend_steps=3)
+    queue = ActionQueue(cfg)
+
+    old_actions = torch.zeros(10, 2)
+    new_actions = torch.ones(10, 2) * 10
+
+    queue.merge(old_actions, old_actions, real_delay=0)
+    queue.get()
+    queue.get()
+
+    queue.merge(new_actions, new_actions, real_delay=0)
+
+    assert queue.last_blend_steps == 3
+    assert queue.qsize() == 10
+    assert torch.allclose(queue.queue[0], torch.tensor([2.5, 2.5]))
+    assert torch.allclose(queue.queue[1], torch.tensor([5.0, 5.0]))
+    assert torch.allclose(queue.queue[2], torch.tensor([7.5, 7.5]))
+    assert torch.allclose(queue.queue[3], torch.tensor([10.0, 10.0]))
+
+
+def test_merge_blends_original_queue_prefix_too():
+    """Test blended prefix is reflected in original_queue for future RTC leftovers."""
+    cfg = RTCConfig(enabled=True, execution_horizon=10, queue_blend_steps=2)
+    queue = ActionQueue(cfg)
+
+    old_original = torch.zeros(6, 1)
+    old_processed = torch.zeros(6, 1)
+    new_original = torch.ones(6, 1) * 6
+    new_processed = torch.ones(6, 1) * 9
+
+    queue.merge(old_original, old_processed, real_delay=0)
+    queue.get()
+
+    queue.merge(new_original, new_processed, real_delay=0)
+
+    assert torch.allclose(queue.original_queue[0], torch.tensor([2.0]))
+    assert torch.allclose(queue.original_queue[1], torch.tensor([4.0]))
+    assert torch.allclose(queue.queue[0], torch.tensor([3.0]))
+    assert torch.allclose(queue.queue[1], torch.tensor([6.0]))
+
+
+def test_merge_skips_blending_when_no_old_actions_left():
+    """Test RTC replacement does not blend when the previous queue is already exhausted."""
+    cfg = RTCConfig(enabled=True, execution_horizon=10, queue_blend_steps=4)
+    queue = ActionQueue(cfg)
+
+    old_actions = torch.zeros(3, 1)
+    new_actions = torch.ones(5, 1)
+
+    queue.merge(old_actions, old_actions, real_delay=0)
+    for _ in range(3):
+        queue.get()
+
+    queue.merge(new_actions, new_actions, real_delay=0)
+
+    assert queue.last_blend_steps == 0
+    assert torch.equal(queue.queue, new_actions)
+
+
 # ====================== merge() with RTC Disabled Tests ======================
 
 
