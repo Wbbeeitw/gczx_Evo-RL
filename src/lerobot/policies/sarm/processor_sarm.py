@@ -278,7 +278,15 @@ class SARMEncodingProcessorStep(ProcessorStep):
         # When language is perturbed, targets are zero so perturbed samples don't contribute to progress loss
         if self.dataset_meta is not None:
             episodes_df = None
-            if self.sparse_subtask_names != ["task"]:
+            needs_episode_annotations = (
+                self.sparse_subtask_names != ["task"]
+                or (
+                    self.config.uses_dual_heads
+                    and self.dense_subtask_names is not None
+                    and len(self.dense_subtask_names) > 1
+                )
+            )
+            if needs_episode_annotations:
                 episodes_df = self.dataset_meta.episodes.to_pandas()
 
             # Generate sparse targets
