@@ -22,6 +22,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.utils.constants import ACTION
 
+#默认图像流顺序
 DEFAULT_ORDERED_IMAGE_KEYS = [
     "observation.images.left_top",
     "observation.images.left_wrist",
@@ -32,6 +33,7 @@ DEFAULT_ORDERED_IMAGE_KEYS = [
     "observation.images.tactile_right_inner",
 ]
 
+#每个传感器对应的文字描述
 DEFAULT_SENSOR_TEXT = {
     "observation.images.left_top": "Global RGB camera: observe the whole scene and object layout.",
     "observation.images.left_wrist": "Left wrist RGB camera: observe the local left gripper view.",
@@ -50,6 +52,7 @@ DEFAULT_SENSOR_TEXT = {
     ),
 }
 
+# 默认话题名称
 DEFAULT_IMAGE_TOPICS = {
     "observation.images.left_top": "/camera/left_top/image_raw",
     "observation.images.left_wrist": "/camera/left_wrist/image_raw",
@@ -60,20 +63,23 @@ DEFAULT_IMAGE_TOPICS = {
     "observation.images.tactile_right_inner": "/tac_map/tactile_right_right",
 }
 
+# 提示词前缀和后缀
 DEFAULT_PROMPT_PREFIX = (
     "You control a bimanual robot from multi-view RGB observations, tactile heatmaps, and robot state."
 )
 DEFAULT_PROMPT_SUFFIX = "Generate the next action chunk that follows the instruction."
 
+# 策略预处理器和后处理器文件名
 POLICY_PREPROCESSOR_FILENAME = "policy_preprocessor.json"
 POLICY_POSTPROCESSOR_FILENAME = "policy_postprocessor.json"
 
-
+#这是一个简单配置类，用来表示一次请求希望模型返回多少个动作
 @dataclass
 class TactilePolicyRequestConfig:
     actions_per_chunk: int | None = None
 
 
+#这个类表示一个已经编码好的机器人观测包。
 @dataclass
 class EncodedTactileObservation:
     timestamp: float
@@ -84,9 +90,11 @@ class EncodedTactileObservation:
     task_prompt: str
     robot_type: str = ""
 
+    # 返回这个观测包携带的时间戳，便于服务端做日志和时序对齐。
     def get_timestamp(self) -> float:
         return self.timestamp
 
+    # 返回这个观测包对应的逻辑时间步编号。
     def get_timestep(self) -> int:
         return self.timestep
 
@@ -97,20 +105,25 @@ class TactileTimedAction:
     timestep: int
     action: np.ndarray
 
+    # 返回这个动作继承自观测包的原始时间戳。
     def get_timestamp(self) -> float:
         return self.timestamp
 
+    # 返回这个动作对应的逻辑时间步编号。
     def get_timestep(self) -> int:
         return self.timestep
 
+    # 返回动作向量本身。
     def get_action(self) -> np.ndarray:
         return self.action
 
 
+# 把逗号分隔的字符串拆成列表，并去掉空项和多余空白。
 def parse_csv_items(csv_text: str) -> list[str]:
     return [item.strip() for item in csv_text.split(",") if item.strip()]
 
 
+# 把逗号分隔的索引文本解析成整数列表；如果为空则返回空值。
 def parse_indices(csv_text: str) -> list[int] | None:
     values = parse_csv_items(csv_text)
     if not values:
@@ -118,6 +131,7 @@ def parse_indices(csv_text: str) -> list[int] | None:
     return [int(value) for value in values]
 
 
+# 解析推理设备；当用户要求自动选择时，使用当前环境里最合适的设备。
 def resolve_device(requested: str) -> str:
     import torch
 
@@ -130,6 +144,7 @@ def resolve_device(requested: str) -> str:
     return "cpu"
 
 
+# 为某一路图像特征生成可读的传感器描述文本，用于拼接提示词。这个函数把图像 key 转成 prompt 中的描述。
 def _label_for_image_key(image_key: str) -> str:
     if image_key in DEFAULT_SENSOR_TEXT:
         return DEFAULT_SENSOR_TEXT[image_key]
@@ -138,6 +153,7 @@ def _label_for_image_key(image_key: str) -> str:
     return f"{suffix.title()}: auxiliary observation stream available for action prediction."
 
 
+# 把原始任务文本扩展成带有多传感器说明的完整策略提示词。
 def build_tactile_prompt(
     task: str,
     image_keys: list[str],
@@ -155,6 +171,7 @@ def build_tactile_prompt(
     return " ".join(part for part in parts if part)
 
 
+# 这个函数用于找到 LeRobot 数据集的真实根目录。
 def resolve_dataset_root(root_arg: str, repo_id: str) -> Path:
     root_path = Path(root_arg).expanduser()
     repo_path = Path(*repo_id.split("/"))
@@ -168,6 +185,7 @@ def resolve_dataset_root(root_arg: str, repo_id: str) -> Path:
     return root_path
 
 
+# 按约定的触觉图像顺序重建策略输入特征，并单独保留动作输出特征。 找数据集中的input output
 def configure_policy_features_for_tactile_metadata(
     policy_cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata,
@@ -202,6 +220,7 @@ def configure_policy_features_for_tactile_metadata(
     policy_cfg.output_features = output_features
 
 
+# 当数据集元信息里的动作维度匹配时，读取动作名称列表；否则返回空值。right_gripper..
 def maybe_get_action_names(ds_meta: LeRobotDatasetMetadata, action_dim: int) -> list[str] | None:
     feature_info = ds_meta.info.get("features", {}).get(ACTION, {})
     names = feature_info.get("names")
@@ -210,6 +229,7 @@ def maybe_get_action_names(ds_meta: LeRobotDatasetMetadata, action_dim: int) -> 
     return None
 
 
+# 把常见数值类型的图像安全归一化成八位无符号整型，方便后续统一编码和传输。图像归一化到 uint8[0, 255]
 def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
     arr = np.asarray(image)
     if arr.dtype == np.uint8:
@@ -229,6 +249,7 @@ def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint8)
 
 
+# 把输入图像统一转换成连续内存的红绿蓝三通道八位整型、高宽通道排列格式。
 def to_rgb_uint8(image: np.ndarray, encoding: str | None = None) -> np.ndarray:
     img = np.asarray(image)
 
@@ -256,10 +277,12 @@ def to_rgb_uint8(image: np.ndarray, encoding: str | None = None) -> np.ndarray:
     raise ValueError(f"Unsupported image shape {img.shape}.")
 
 
+# 根据特征名判断这一帧图像是否属于触觉模态。
 def is_tactile_key(image_key: str) -> bool:
     return "tactile_" in image_key
 
 
+# 按指定格式把单帧图像压缩成字节流，供远程调用传输使用。
 def encode_image_for_transport(
     image: np.ndarray,
     transport_format: str,
@@ -278,6 +301,7 @@ def encode_image_for_transport(
     return bytes(buffer)
 
 
+# 把网络传输中的压缩图像字节解码回标准红绿蓝八位整型图像。
 def decode_image_from_transport(buffer: bytes, transport_format: str) -> np.ndarray:
     if transport_format not in {"jpeg", "png"}:
         raise ValueError(f"Unsupported transport format '{transport_format}'.")
@@ -287,6 +311,7 @@ def decode_image_from_transport(buffer: bytes, transport_format: str) -> np.ndar
     return to_rgb_uint8(image, encoding="bgr8")
 
 
+# 把状态、图像和提示词打包成客户端与服务端共享的可序列化观测对象。numpy 图像编码成 bytes，用于网络传输、RPC 调用、队列传输等
 def encode_observation_packet(
     observation: dict[str, np.ndarray],
     ordered_image_keys: list[str],
@@ -322,6 +347,7 @@ def encode_observation_packet(
     )
 
 
+# 把收到的观测包还原成推理函数可直接使用的观测字典。
 def decode_observation_packet(packet: EncodedTactileObservation) -> dict[str, np.ndarray]:
     observation = {"observation.state": np.asarray(packet.state, dtype=np.float32)}
     for image_key, buffer in packet.encoded_images.items():

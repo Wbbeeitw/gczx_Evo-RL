@@ -69,6 +69,7 @@ from lerobot.utils.train_utils import (
 )
 from lerobot.utils.utils import format_big_number, init_logging
 
+# 约定策略使用的 7 路图像输入顺序。
 DEFAULT_ORDERED_IMAGE_KEYS = [
     "observation.images.left_top",
     "observation.images.left_wrist",
@@ -79,6 +80,7 @@ DEFAULT_ORDERED_IMAGE_KEYS = [
     "observation.images.tactile_right_inner",
 ]
 
+# 为每一路图像流准备默认的自然语言传感器说明。
 DEFAULT_SENSOR_TEXT = {
     "observation.images.left_top": "Global RGB camera: observe the whole scene and object layout.",
     "observation.images.left_wrist": "Left wrist RGB camera: observe the local left gripper view.",
@@ -97,7 +99,7 @@ DEFAULT_SENSOR_TEXT = {
     ),
 }
 
-
+# 控制如何把原始 task 文本扩展为带触觉语义的提示词。
 @dataclass
 class TactilePromptConfig:
     enable: bool = True
@@ -109,16 +111,19 @@ class TactilePromptConfig:
     )
     prompt_suffix: str = "Generate the next action chunk that follows the instruction."
 
+    # 校验提示词配置是否合法，避免缺少任务字段或图像键列表。
     def validate(self) -> None:
         if not self.task_field:
             raise ValueError("'tactile_prompt.task_field' must be non-empty.")
         if len(self.image_keys()) == 0:
             raise ValueError("'tactile_prompt.ordered_image_keys' must contain at least one key.")
 
+    # 把逗号分隔的图像键配置解析成列表形式。
     def image_keys(self) -> list[str]:
         return [key.strip() for key in self.ordered_image_keys.split(",") if key.strip()]
 
 
+# 封装一组偏论文实验风格的默认训练超参数。
 @dataclass
 class ThesisPresetConfig:
     enable: bool = True
@@ -138,6 +143,7 @@ class ThesisPresetConfig:
     train_expert_only: bool = True
     train_visual_projector: bool = True
 
+    # 校验论文预设里的数值超参数是否合法。
     def validate(self) -> None:
         if self.batch_size <= 0:
             raise ValueError("'thesis_preset.batch_size' must be > 0.")
@@ -150,6 +156,7 @@ class ThesisPresetConfig:
         if self.optimizer_lr <= 0:
             raise ValueError("'thesis_preset.optimizer_lr' must be > 0.")
 
+    # 把论文预设中的默认值覆盖到训练总配置和策略配置上。
     def apply(self, cfg: "TactileTrainPipelineConfig") -> None:
         if not self.enable:
             return
@@ -180,12 +187,13 @@ class ThesisPresetConfig:
             if hasattr(cfg.policy, attr_name):
                 setattr(cfg.policy, attr_name, attr_value)
 
-
+# 在通用 TrainPipelineConfig 基础上扩展触觉提示词和论文预设配置。
 @dataclass
 class TactileTrainPipelineConfig(TrainPipelineConfig):
     tactile_prompt: TactilePromptConfig = field(default_factory=TactilePromptConfig)
     thesis_preset: ThesisPresetConfig = field(default_factory=ThesisPresetConfig)
 
+    # 先做父类校验，再应用触觉相关配置和策略预设。
     def validate(self) -> None:
         super().validate()
         self.tactile_prompt.validate()
@@ -196,7 +204,7 @@ class TactileTrainPipelineConfig(TrainPipelineConfig):
             self.optimizer = self.policy.get_optimizer_preset()
             self.scheduler = self.policy.get_scheduler_preset()
 
-
+# 为某一路图像特征生成提示词里使用的文字描述。
 def _label_for_image_key(image_key: str) -> str:
     if image_key in DEFAULT_SENSOR_TEXT:
         return DEFAULT_SENSOR_TEXT[image_key]
@@ -204,7 +212,7 @@ def _label_for_image_key(image_key: str) -> str:
     suffix = image_key.split(".")[-1].replace("_", " ")
     return f"{suffix.title()}: auxiliary observation stream available for action prediction."
 
-
+# 把任务文本和多路传感器描述拼接成完整的策略提示词。
 def build_tactile_prompt(task: str, image_keys: list[str], cfg: TactilePromptConfig) -> str:
     parts: list[str] = []
     if cfg.prompt_prefix.strip():
@@ -220,12 +228,14 @@ def build_tactile_prompt(task: str, image_keys: list[str], cfg: TactilePromptCon
 
     return " ".join(part for part in parts if part)
 
-
+# 在批数据进入预处理前，把 task 字段改写成带触觉语义的提示词。
 class TactilePromptHook:
+    # 保存提示词配置，并提前解析出约定的图像键顺序。
     def __init__(self, cfg: TactilePromptConfig):
         self.cfg = cfg
         self.image_keys = cfg.image_keys()
 
+    # 对一个 batch 中的任务文本逐条改写，并校验所需图像键是否齐全。
     def __call__(self, batch: Any, _: int) -> Any:
         if not isinstance(batch, dict):
             raise TypeError(f"Tactile prompt batch must be dict, got {type(batch).__name__}.")
@@ -252,13 +262,14 @@ class TactilePromptHook:
         ]
         return batch
 
-
+# 根据配置决定是否启用触觉提示词钩子。
 def build_tactile_prompt_hook(cfg: TactilePromptConfig) -> TactilePromptHook | None:
     if not cfg.enable:
         return None
     return TactilePromptHook(cfg)
 
 
+# 执行一次完整的策略参数更新，并返回训练指标与附加日志信息。
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -314,7 +325,7 @@ def update_policy(
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
-
+# 按固定的 7 路图像顺序重建数据集对应的策略输入特征定义。
 def configure_policy_features_for_tactile_dataset(
     cfg: TactileTrainPipelineConfig,
     dataset,
@@ -352,7 +363,7 @@ def configure_policy_features_for_tactile_dataset(
     cfg.policy.input_features = ordered_input_features
     cfg.policy.output_features = output_features
 
-
+# 尝试从 pi05 模型结构中定位视觉投影层，供局部微调使用。
 def _resolve_pi05_visual_projector(policy: PreTrainedPolicy):
     pi05_model = getattr(policy, "model", None)
     if pi05_model is None:
@@ -375,7 +386,7 @@ def _resolve_pi05_visual_projector(policy: PreTrainedPolicy):
 
     return None
 
-
+# 尝试从 pi05 模型结构中定位动作专家模块。
 def _resolve_pi05_action_expert(policy: PreTrainedPolicy):
     pi05_model = getattr(policy, "model", None)
     if pi05_model is None:
@@ -387,7 +398,7 @@ def _resolve_pi05_action_expert(policy: PreTrainedPolicy):
 
     return getattr(paligemma_with_expert, "gemma_expert", None)
 
-
+# 冻结大部分参数，只保留动作专家和可选视觉投影层参与触觉微调。
 def configure_trainable_parameters_for_tactile_finetune(
     cfg: TactileTrainPipelineConfig,
     policy: PreTrainedPolicy,
@@ -424,7 +435,7 @@ def configure_trainable_parameters_for_tactile_finetune(
     for param in visual_projector.parameters():
         param.requires_grad = True
 
-
+# 校验当前可训练参数集合是否仍然限制在预期的少量模块范围内。
 def validate_tactile_finetune_parameter_subset(
     cfg: TactileTrainPipelineConfig,
     policy: PreTrainedPolicy,
@@ -460,7 +471,7 @@ def validate_tactile_finetune_parameter_subset(
             f"{preview}{' ...' if len(unexpected_trainable) > len(preview) else ''}"
         )
 
-
+# 统计并打印当前可训练参数分别落在哪些模块桶里。
 def log_tactile_finetune_parameter_subset(policy: PreTrainedPolicy) -> None:
     bucket_rules = {
         "gemma_expert": ".paligemma_with_expert.gemma_expert.",
@@ -485,14 +496,17 @@ def log_tactile_finetune_parameter_subset(policy: PreTrainedPolicy) -> None:
 
 
 @parser.wrap()
+# 训练主入口：构建数据集、策略、处理器和训练循环，并负责保存与评估。
 def train(
     cfg: TactileTrainPipelineConfig,
     accelerator: "Accelerator | None" = None,
 ):
+    # 先校验总配置，再构建批级钩子。
     cfg.validate()
     acp_raw_batch_hook = build_acp_raw_batch_hook(cfg.acp, cfg.seed)
     tactile_prompt_hook = build_tactile_prompt_hook(cfg.tactile_prompt)
 
+    # 如果外部没有传入 Accelerator，则在这里创建一个默认实例。
     if accelerator is None:
         from accelerate import Accelerator
         from accelerate.utils import DistributedDataParallelKwargs
@@ -522,6 +536,7 @@ def train(
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
+    # 主进程优先构建数据集并检查触觉图像键与 ACP 统计信息。
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
@@ -560,15 +575,18 @@ def train(
 
     accelerator.wait_for_everyone()
 
+    # 非主进程在同步点之后再各自创建数据集，避免重复日志输出。
     if not is_main_process:
         dataset = make_dataset(cfg)
         configure_policy_features_for_tactile_dataset(cfg, dataset)
 
     eval_env = None
+    # 按需创建评估环境。
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
+    # 创建策略，并应用触觉微调时的参数冻结规则。
     if is_main_process:
         logging.info("Policy image order: %s", list(cfg.policy.image_features.keys()))
         logging.info("Creating policy")
@@ -587,6 +605,7 @@ def train(
 
     accelerator.wait_for_everyone()
 
+    # 根据 checkpoint 和数据集统计信息构建预处理器与后处理器。
     processor_kwargs = {}
     postprocessor_kwargs = {}
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
@@ -625,6 +644,7 @@ def train(
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
+    # 如果启用了 RA-BC，则在这里准备对应的动态样本权重器。
     rabc_weights = None
     if cfg.use_rabc:
         from lerobot.utils.rabc import RABCWeights
@@ -682,6 +702,7 @@ def train(
         shuffle = True
         sampler = None
 
+    # 构建数据加载器，并交给 accelerate 接管分布式包装。
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -732,6 +753,7 @@ def train(
         if key not in prompt_keys:
             prompt_keys.append(key)
 
+    # 主训练循环：取 batch、改写提示词、前向反向、记录日志、保存和评估。
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -794,6 +816,7 @@ def train(
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
+        # 到达保存步时，把模型权重和处理器状态一起写入 checkpoint。
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
@@ -814,6 +837,7 @@ def train(
 
             accelerator.wait_for_everyone()
 
+        # 到达评估步时，运行整套评估流程并记录评估指标与视频。
         if cfg.env and is_eval_step:
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
@@ -863,6 +887,7 @@ def train(
     if eval_env:
         close_envs(eval_env)
 
+    # 训练结束后，按需把模型和处理器推送到 Hub。
     if is_main_process:
         logging.info("End of training")
 
@@ -879,6 +904,7 @@ def train(
     accelerator.end_training()
 
 
+# 注册第三方插件后进入训练主流程。
 def main() -> None:
     register_third_party_plugins()
     train()

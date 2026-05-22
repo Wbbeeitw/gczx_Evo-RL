@@ -43,7 +43,7 @@ from tactile_client_server_common import (
     resolve_device,
 )
 
-
+# 解析服务端启动参数，包括模型、数据集、监听地址和每次返回的动作数。
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Standalone tactile pi05 policy server using the existing LeRobot gRPC transport.",
@@ -77,16 +77,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# 远程触觉策略推理服务端：接收观测包，执行推理，并返回动作块。
 class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
+    # 加载 checkpoint、数据集元信息、处理器和策略，并初始化单槽位观测队列。
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.device = resolve_device(args.device)
         self.device_type = torch.device(self.device).type
         self.ordered_image_keys = parse_csv_items(args.ordered_image_keys)
+        # 这里只保留一个最新观测，优先降低端到端延迟，而不是保证每帧都参与推理。
         self.observation_queue: Queue[EncodedTactileObservation] = Queue(maxsize=1)
         self.actions_per_chunk = 0
         self.use_amp = self.device_type == "cuda" and not args.disable_amp
 
+        # 根据数据集元信息重建与训练阶段一致的输入特征顺序。
         dataset_root = resolve_dataset_root(args.dataset_root, args.dataset_repo_id)
         logging.info("Resolved dataset root: %s", dataset_root)
         self.ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=dataset_root)
@@ -113,6 +117,7 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.max_actions_per_chunk,
         )
 
+    # 优先复用 checkpoint 里保存的处理器；必要时再用配置和统计信息重建。
     def _make_processors(
         self,
         policy_cfg: PreTrainedConfig,
@@ -139,15 +144,18 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         logging.info("Rebuilding pre/post processors from config and dataset stats.")
         return make_pre_post_processors(policy_cfg, dataset_stats=self.ds_meta.stats)
 
+    # 在新客户端准备就绪时重置服务端状态，避免沿用上一个会话的残留队列和配置。
     def _reset_state(self) -> None:
         self.observation_queue = Queue(maxsize=1)
         self.actions_per_chunk = self.default_actions_per_chunk
 
+    # RPC：客户端声明“我已准备好”，服务端据此重置内部状态。
     def Ready(self, request, context):  # noqa: N802
         logging.info("Client ready: %s", context.peer())
         self._reset_state()
         return services_pb2.Empty()
 
+    # RPC：接收客户端发送的策略指令，目前主要用于覆盖每次返回的动作块长度。
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         if not request.data:
             return services_pb2.Empty()
@@ -166,6 +174,7 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         logging.info("Updated per-client actions_per_chunk=%d", self.actions_per_chunk)
         return services_pb2.Empty()
 
+    # RPC：接收分块上传的观测字节流，反序列化后放入单槽位观测队列。
     def SendObservations(self, request_iterator, context):  # noqa: N802
         received_bytes = receive_bytes_in_chunks(
             request_iterator,
@@ -180,6 +189,7 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if not isinstance(packet, EncodedTactileObservation):
             raise TypeError(f"Expected EncodedTactileObservation, got {type(packet).__name__}")
 
+        # 如果队列已满，则丢弃旧观测，只保留最新的一帧。
         if self.observation_queue.full():
             try:
                 self.observation_queue.get_nowait()
@@ -189,6 +199,7 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         logging.debug("Queued observation #%d", packet.get_timestep())
         return services_pb2.Empty()
 
+    # RPC：取出最新观测执行推理，并把动作块序列化后返回给客户端。
     def GetActions(self, request, context):  # noqa: N802
         try:
             packet = self.observation_queue.get(timeout=self.args.obs_queue_timeout_s)
@@ -206,6 +217,7 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         return services_pb2.Actions(data=pickle.dumps(action_chunk))  # nosec B301: internal transport only
 
+    # 完成一次完整的服务端推理：解码观测、预处理、策略预测、后处理和封装返回值。
     def _predict_action_chunk(self, packet: EncodedTactileObservation) -> list[TactileTimedAction]:
         observation_np = decode_observation_packet(packet)
 
@@ -213,6 +225,7 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             torch.inference_mode(),
             torch.autocast(device_type=self.device_type) if self.use_amp else nullcontext(),
         ):
+            # 先把原始 numpy 观测整理成策略推理期所需的输入格式。
             observation = prepare_observation_for_inference(
                 observation=observation_np,
                 device=torch.device(self.device),
@@ -222,10 +235,12 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation = self.preprocessor(observation)
             action_tensor = self.policy.predict_action_chunk(observation)
 
+            # 统一动作张量形状，并按当前配置截取本次需要返回的动作数量。
             if action_tensor.ndim != 3:
                 action_tensor = action_tensor.unsqueeze(0)
             action_tensor = action_tensor[:, : self.actions_per_chunk, :]
 
+            # 对动作块中的每一步动作分别做后处理，恢复到可执行动作空间。
             processed_actions = []
             for i in range(action_tensor.shape[1]):
                 processed_actions.append(self.postprocessor(action_tensor[:, i, :]))
@@ -241,16 +256,20 @@ class TactilePolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         ]
 
 
+# 为分块接收工具提供一个永远不会触发关闭的占位事件对象。
 class _NoOpShutdownEvent:
+    # 始终返回 False，表示当前接收过程不需要被外部中断。
     def is_set(self) -> bool:
         return False
 
 
+# 进程入口：构建 gRPC 服务端并开始监听推理请求。
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     server_impl = TactilePolicyServer(args)
 
+    # 使用线程池承载 gRPC 请求处理，并注册推理服务实现。
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),
         options=grpc_channel_options(),
