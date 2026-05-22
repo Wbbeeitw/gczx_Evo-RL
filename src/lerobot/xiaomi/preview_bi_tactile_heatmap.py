@@ -4,8 +4,12 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -43,7 +47,7 @@ from lerobot.xiaomi.tactile_defaults import (
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Preview left/right Xiaomi tactile heatmaps in real time without recording a dataset."
+        description="Serve a browser-based preview page for left/right Xiaomi tactile heatmaps."
     )
     parser.add_argument("--xiaomi-xr0-root", type=parse_optional_path, default=None)
     parser.add_argument("--left-tactile-port", required=True, help="Left tactile controller serial port.")
@@ -146,9 +150,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="tactile_log_level",
         default="INFO",
     )
-    parser.add_argument("--window-name", default="BiTactile Heatmap Preview")
+    parser.add_argument("--page-title", default="BiTactile Heatmap Preview")
     parser.add_argument("--show-fps", type=parse_bool, default=True)
-    parser.add_argument("--max-frames", type=int, default=0, help="Stop after N rendered frames. 0 means run forever.")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind address.")
+    parser.add_argument("--http-port", type=int, default=8765, help="HTTP port for the preview page.")
+    parser.add_argument("--refresh-ms", type=int, default=250, help="Browser refresh interval in milliseconds.")
+    parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality for the browser frame endpoint.")
     return parser
 
 
@@ -184,10 +191,155 @@ def _stack_preview(left_rgb: np.ndarray, right_rgb: np.ndarray, *, title: str, f
     canvas[header_h + left_rgb.shape[0] :, : right_rgb.shape[1]] = right_rgb
 
     cv2.putText(canvas, title, (12, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-    cv2.putText(canvas, "Top: left tactile   Bottom: right tactile", (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 1)
+    cv2.putText(
+        canvas,
+        "Top: left tactile   Bottom: right tactile",
+        (12, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 220, 255),
+        1,
+    )
     if fps_text is not None:
-        cv2.putText(canvas, fps_text, (width - 120, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+        cv2.putText(canvas, fps_text, (max(width - 120, 12), 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
     return canvas
+
+
+class PreviewState:
+    def __init__(self, *, title: str, show_fps: bool) -> None:
+        self.title = title
+        self.show_fps = show_fps
+        self._lock = threading.Lock()
+        self._last_frame_t: float | None = None
+        self._smoothed_fps = 0.0
+
+    def render_canvas(self, left_camera: TactileSideCamera, right_camera: TactileSideCamera) -> np.ndarray:
+        with self._lock:
+            left_rgb = left_camera.read_image()
+            right_rgb = right_camera.read_image()
+
+            fps_text = None
+            if self.show_fps:
+                now_t = time.perf_counter()
+                if self._last_frame_t is not None:
+                    dt = max(now_t - self._last_frame_t, 1e-6)
+                    fps = 1.0 / dt
+                    self._smoothed_fps = fps if self._smoothed_fps <= 0.0 else (0.9 * self._smoothed_fps + 0.1 * fps)
+                    fps_text = f"{self._smoothed_fps:5.1f} FPS"
+                self._last_frame_t = now_t
+
+            return _stack_preview(left_rgb, right_rgb, title=self.title, fps_text=fps_text)
+
+
+def _encode_jpeg(image_rgb: np.ndarray, jpeg_quality: int) -> bytes:
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(jpeg_quality, 1, 100))],
+    )
+    if not ok:
+        raise RuntimeError("Failed to encode tactile preview frame as JPEG.")
+    return encoded.tobytes()
+
+
+def make_handler(
+    *,
+    left_camera: TactileSideCamera,
+    right_camera: TactileSideCamera,
+    preview_state: PreviewState,
+    refresh_ms: int,
+    jpeg_quality: int,
+    logger: logging.Logger,
+) -> type[BaseHTTPRequestHandler]:
+    class PreviewHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                self._serve_index()
+                return
+            if path == "/frame.jpg":
+                self._serve_frame()
+                return
+            if path == "/healthz":
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+
+        def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+            logger.info("preview %s", fmt % args)
+
+        def _serve_index(self) -> None:
+            html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{preview_state.title}</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: monospace;
+      background: #101418;
+      color: #e6edf3;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+    }}
+    .wrap {{
+      width: min(92vw, 900px);
+    }}
+    img {{
+      width: 100%;
+      border: 1px solid #2f3b45;
+      background: #000;
+      display: block;
+    }}
+    .hint {{
+      margin-top: 12px;
+      opacity: 0.8;
+      line-height: 1.6;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <img id="frame" src="/frame.jpg" alt="bi tactile preview">
+    <div class="hint">
+      Top: left tactile | Bottom: right tactile<br>
+      Auto-refreshing every {refresh_ms} ms
+    </div>
+  </div>
+  <script>
+    const frame = document.getElementById("frame");
+    const refresh = () => {{
+      frame.src = "/frame.jpg?t=" + Date.now();
+    }};
+    setInterval(refresh, {refresh_ms});
+  </script>
+</body>
+</html>
+"""
+            body = html.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _serve_frame(self) -> None:
+            image = preview_state.render_canvas(left_camera, right_camera)
+            body = _encode_jpeg(image, jpeg_quality)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return PreviewHandler
 
 
 def main() -> None:
@@ -203,46 +355,34 @@ def main() -> None:
     )
     left_camera = _make_tactile_camera("left", args.left_tactile_port, bundle, args)
     right_camera = _make_tactile_camera("right", args.right_tactile_port, bundle, args)
+    preview_state = PreviewState(title=args.page_title, show_fps=args.show_fps)
 
-    cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(
-        args.window_name,
-        int(args.tactile_output_size * 2 * 0.95),
-        int((args.tactile_output_size * 2 + 48) * 0.95),
-    )
-
-    last_t = time.perf_counter()
-    smoothed_fps = 0.0
-    frame_count = 0
+    server: ThreadingHTTPServer | None = None
     try:
         left_camera.start()
         right_camera.start()
-        logger.info("Press 'q' or ESC to exit tactile preview.")
 
-        while args.max_frames <= 0 or frame_count < args.max_frames:
-            left_rgb = left_camera.read_image()
-            right_rgb = right_camera.read_image()
-
-            now_t = time.perf_counter()
-            dt = max(now_t - last_t, 1e-6)
-            last_t = now_t
-            fps = 1.0 / dt
-            smoothed_fps = fps if smoothed_fps <= 0.0 else (0.9 * smoothed_fps + 0.1 * fps)
-            fps_text = f"{smoothed_fps:5.1f} FPS" if args.show_fps else None
-
-            canvas = _stack_preview(left_rgb, right_rgb, title=args.window_name, fps_text=fps_text)
-            cv2.imshow(args.window_name, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
-            frame_count += 1
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q"), ord("Q")):
-                break
+        handler = make_handler(
+            left_camera=left_camera,
+            right_camera=right_camera,
+            preview_state=preview_state,
+            refresh_ms=args.refresh_ms,
+            jpeg_quality=args.jpeg_quality,
+            logger=logger,
+        )
+        server = ThreadingHTTPServer((args.host, args.http_port), handler)
+        logger.info("Bi-tactile preview available at http://%s:%s", args.host, args.http_port)
+        logger.info("Open the page locally or use SSH port forwarding if the script runs on a remote server.")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Stopping bi-tactile preview server")
     finally:
+        if server is not None:
+            server.server_close()
         try:
             left_camera.stop()
         finally:
             right_camera.stop()
-        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

@@ -122,6 +122,25 @@ def _build_realsense_camera_configs(raw_text: str, arg_name: str) -> dict[str, R
     return camera_configs
 
 
+def _validate_camera_capture_fps(
+    camera_configs: dict[str, RealSenseCameraConfig],
+    *,
+    dataset_fps: int,
+    arg_name: str,
+) -> None:
+    mismatched = {
+        camera_key: int(camera_config.fps)
+        for camera_key, camera_config in camera_configs.items()
+        if int(camera_config.fps) != int(dataset_fps)
+    }
+    if mismatched:
+        details = ", ".join(f"{camera_key}={camera_fps}" for camera_key, camera_fps in sorted(mismatched.items()))
+        raise ValueError(
+            f"{arg_name} camera fps must match --dataset.fps={dataset_fps}. "
+            f"Found mismatched camera fps: {details}."
+        )
+
+
 def _parse_realsense_rotation(value: Any) -> int:
     if value is None:
         return 0
@@ -246,6 +265,7 @@ class TactileSideCamera:
         self._last_image = np.zeros(self.image_shape, dtype=np.uint8)
         self._last_timestamp: float | None = None
         self._started = False
+        self._stale_read_count = 0
 
     @property
     def is_connected(self) -> bool:
@@ -283,10 +303,20 @@ class TactileSideCamera:
     def read_image(self) -> np.ndarray:
         snapshot = self.runtime.get_snapshot(copy_snapshot=True)
         if snapshot is None:
+            self._report_stale_frame(reason="snapshot unavailable")
             return self._last_image.copy()
         if self._last_timestamp is not None and snapshot.frame.timestamp <= self._last_timestamp:
+            self._report_stale_frame(reason="timestamp did not advance")
             return self._last_image.copy()
 
+        if self._stale_read_count > 0:
+            self.logger.info(
+                "Tactile stream on %s (%s) resumed with a fresh frame after %d repeated read(s).",
+                self.port,
+                self.side_name,
+                self._stale_read_count,
+            )
+        self._stale_read_count = 0
         self._last_timestamp = snapshot.frame.timestamp
         self._last_image = self._render_heatmap_rgb(snapshot)
         return self._last_image.copy()
@@ -302,6 +332,17 @@ class TactileSideCamera:
             heatmap_bgr = self.visualizer.make_fz_heatmap(coords, distributed)
             rendered_views.append(np.ascontiguousarray(heatmap_bgr[..., ::-1]))
         return np.ascontiguousarray(np.hstack(rendered_views))
+
+    def _report_stale_frame(self, *, reason: str) -> None:
+        self._stale_read_count += 1
+        if self._stale_read_count == 10 or self._stale_read_count % 100 == 0:
+            self.logger.warning(
+                "No fresh tactile frame on %s (%s): %s. Reusing the previous heatmap frame. "
+                "Recorded video length will still match the dataset fps, but the effective tactile update rate is lower.",
+                self.port,
+                self.side_name,
+                reason,
+            )
 
 
 class BiPiperFollowerWithTactile(Robot):
@@ -712,6 +753,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _make_bi_piper_follower(args: argparse.Namespace) -> BiPiperFollower:
     left_cameras = _build_realsense_camera_configs(args.left_arm_cameras, "--robot.left_arm_config.cameras")
     right_cameras = _build_realsense_camera_configs(args.right_arm_cameras, "--robot.right_arm_config.cameras")
+    _validate_camera_capture_fps(
+        left_cameras,
+        dataset_fps=args.fps,
+        arg_name="--robot.left_arm_config.cameras",
+    )
+    _validate_camera_capture_fps(
+        right_cameras,
+        dataset_fps=args.fps,
+        arg_name="--robot.right_arm_config.cameras",
+    )
     follower_config = BiPiperFollowerConfig(
         id=args.robot_id,
         calibration_dir=args.calibration_dir,
