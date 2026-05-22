@@ -1,0 +1,16 @@
+"""Shared tactile heatmap defaults for Xiaomi data collection tools.
+
+These values are intentionally aligned with the recommended preview command in:
+`Xiaomi-Robotics-0/xr0/docs/tactile_toolkit.md`
+"""
+
+TACTILE_DEFAULT_MODE = "auto_push"
+TACTILE_DEFAULT_CALIBRATE = True
+TACTILE_DEFAULT_CALIBRATION_WARMUP_FRAMES = 30
+TACTILE_DEFAULT_CALIBRATION_SAMPLES = 80
+TACTILE_DEFAULT_CALIBRATION_INTERVAL = 0.03
+TACTILE_DEFAULT_CALIBRATION_REDUCER = "median"
+TACTILE_DEFAULT_HEATMAP_VMIN = 0.0
+TACTILE_DEFAULT_HEATMAP_VMAX = 5.0
+TACTILE_DEFAULT_HEATMAP_COLORMAP = "turbo"
+TACTILE_DEFAULT_HEATMAP_GAMMA = 0.55
