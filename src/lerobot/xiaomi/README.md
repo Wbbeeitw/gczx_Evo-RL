@@ -4,6 +4,7 @@
 
 - `record_bi_piper_tactile.py`
 - `preview_bi_tactile_heatmap.py`
+- `serve_tactile_dataset_videos.py`
 
 它们不会修改 `lerobot-record` 本体，而是在原有双臂 PiPER 采集流程基础上，额外加入两路 Xiaomi 触觉热力图：
 
@@ -157,6 +158,37 @@ ssh -L 8765:127.0.0.1:8765 <user>@<server>
 http://127.0.0.1:8765
 ```
 
+## 查看已采集触觉视频
+
+如果你已经完成了一次采集，想回看数据集里保存下来的左右手触觉 MP4，可以运行：
+
+```bash
+PYTHONNOUSERSITE=1 /home/enine/miniconda3/bin/conda run --no-capture-output -n SACM env PYTHONUNBUFFERED=1 \
+  python src/lerobot/xiaomi/serve_tactile_dataset_videos.py \
+  --dataset-root /home/enine/SACM/lerobot_dataset/5_20_flod_towel_and_xiaomi_tactile \
+  --host 127.0.0.1 \
+  --http-port 8767
+```
+
+说明：
+
+- 这个脚本用于查看已经采集完成并落盘后的触觉视频，不读取实时串口
+- 页面会并排显示左手和右手触觉视频
+- 页面顶部可以切换 episode，也可以一键同时播放、暂停、重新从该 episode 起点播放
+- 如果多个 episode 共用同一个 MP4 文件，页面会根据数据集元信息自动跳转到该 episode 的起止时间，而不是从整段视频头部开始看
+
+如果脚本运行在远程服务器上，推荐在你本机做 SSH 端口转发：
+
+```bash
+ssh -L 8767:127.0.0.1:8767 <user>@<server>
+```
+
+然后在你本机浏览器打开：
+
+```text
+http://127.0.0.1:8767
+```
+
 ## 输出内容
 
 最终生成的 LeRobot 数据集会新增两路 observation 视频键：
@@ -223,6 +255,14 @@ http://127.0.0.1:8765
   网页预览端口，默认 `8765`
 - `--refresh-ms`
   浏览器刷新间隔，默认 `250`
+- `--dataset-root`
+  已采集 LeRobot 数据集根目录，供 `serve_tactile_dataset_videos.py` 回看触觉 MP4
+- `--left-key`
+  左手触觉视频键，默认 `observation.images.left_tactile`
+- `--right-key`
+  右手触觉视频键，默认 `observation.images.right_tactile`
+- `--log-level`
+  已采集触觉视频查看服务的日志级别，默认 `INFO`
 
 ## 注意事项
 
