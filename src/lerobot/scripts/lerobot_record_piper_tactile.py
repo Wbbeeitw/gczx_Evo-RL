@@ -165,6 +165,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tactile-heatmap-vmax", type=float, default=25.5)
     parser.add_argument("--tactile-colormap", type=str, default="turbo")
     parser.add_argument("--tactile-gamma", type=float, default=0.75)
+    parser.add_argument("--tactile-rgb-vmax-fz", type=float, default=25.5)
+    parser.add_argument("--tactile-rgb-vmax-shear", type=float, default=12.8)
     parser.add_argument("--tactile-calibrate-on-connect", action="store_true", default=True)
     # Piper params
     parser.add_argument("--follower-startup-sleep-s", type=float, default=0.5)
@@ -234,6 +236,8 @@ def main():
             output_size=args.tactile_output_size,
             heatmap_vmin=args.tactile_heatmap_vmin,
             heatmap_vmax=args.tactile_heatmap_vmax,
+            rgb_vmax_fz=args.tactile_rgb_vmax_fz,
+            rgb_vmax_shear=args.tactile_rgb_vmax_shear,
             heatmap_colormap=args.tactile_colormap,
             heatmap_gamma=args.tactile_gamma,
             calibrate_on_connect=args.tactile_calibrate_on_connect,
@@ -244,6 +248,8 @@ def main():
             output_size=args.tactile_output_size,
             heatmap_vmin=args.tactile_heatmap_vmin,
             heatmap_vmax=args.tactile_heatmap_vmax,
+            rgb_vmax_fz=args.tactile_rgb_vmax_fz,
+            rgb_vmax_shear=args.tactile_rgb_vmax_shear,
             heatmap_colormap=args.tactile_colormap,
             heatmap_gamma=args.tactile_gamma,
             calibrate_on_connect=args.tactile_calibrate_on_connect,
