@@ -90,8 +90,12 @@ def format_force(values) -> str:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        force=True,
+    )
     logger = logging.getLogger("tactile-monitor")
+    print("Tactile monitor starting on %s ..." % args.port, flush=True)
 
     driver = TactileSensorDriver(
         port=args.port,
@@ -153,6 +157,11 @@ def main() -> None:
                 frames_seen,
                 format_force(index_force),
                 format_force(middle_force),
+            )
+            print(
+                "[%05d] index=%s middle=%s"
+                % (frames_seen, format_force(index_force), format_force(middle_force)),
+                flush=True,
             )
 
             if args.output_dir is not None and args.save_every > 0 and frames_seen % args.save_every == 0:
