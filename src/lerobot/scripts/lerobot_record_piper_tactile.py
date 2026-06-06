@@ -56,6 +56,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.utils import combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
+from lerobot.processor import make_default_processors
 from lerobot.robots import (
     make_robot_from_config,
 )
@@ -70,7 +71,6 @@ from lerobot.teleoperators import make_teleoperator_from_config
 from lerobot.teleoperators.bi_piper_leader import BiPiperLeaderConfig
 from lerobot.teleoperators.bi_piper_leader import BiPiperXLeaderConfig
 from lerobot.teleoperators.piper_leader import PiperLeaderConfigBase
-from lerobot.utils.constants import ACTION
 from lerobot.utils.control_utils import (
     sanity_check_bimanual_piper_pair,
     sanity_check_dataset_name,
@@ -338,22 +338,20 @@ def main():
     # ---- Create LeRobot dataset ----------------------------------------------
     sanity_check_dataset_name(args.dataset_repo_id, None)
 
-    # Build feature schema from robot
+    # Build feature schema from robot (same as lerobot-record)
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
-            pipeline=None,
+            pipeline=teleop_action_processor,
             initial_features=create_initial_features(action=robot.action_features),
             use_videos=True,
         ),
         aggregate_pipeline_dataset_features(
-            pipeline=None,
+            pipeline=robot_observation_processor,
             initial_features=create_initial_features(observation=robot.observation_features),
             use_videos=True,
         ),
     )
-    # Fix: set action names to match the motor feature keys
-    action_names = list(robot.action_features.keys())
-    dataset_features[ACTION]["names"] = action_names
 
     dataset = LeRobotDataset.create(
         args.dataset_repo_id,
