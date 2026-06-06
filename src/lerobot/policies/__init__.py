@@ -24,6 +24,7 @@ from .smolvla.processor_smolvla import SmolVLANewLineProcessor
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
+from .xr0.configuration_xr0 import XR0Config as XR0Config
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
 __all__ = [
@@ -40,4 +41,5 @@ __all__ = [
     "GrootConfig",
     "XVLAConfig",
     "WallXConfig",
+    "XR0Config",
 ]

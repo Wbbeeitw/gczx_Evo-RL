@@ -178,3 +178,8 @@ outputs/
 *.xml
 *.part
 AGENTS.md
+
+# Personal / Claude files
+CLAUDE.md
+.claude/
+.memory/
