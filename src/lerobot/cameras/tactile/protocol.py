@@ -185,7 +185,7 @@ class TactileSerialProtocol:
                             if expected_len is not None and len(data) >= expected_len:
                                 data = data[:expected_len]
                                 break
-                        start = time.time()
+                            start = time.time()  # only reset when header found
                     time.sleep(0.001)
             return data if data else None
         except Exception as exc:
