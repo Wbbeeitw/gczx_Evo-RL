@@ -199,3 +199,7 @@ def main() -> None:
         logger.info("Stopping tactile preview server")
     finally:
         runtime.stop()
+
+
+if __name__ == "__main__":
+    main()

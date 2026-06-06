@@ -165,3 +165,7 @@ def main() -> None:
                 logger.info("Saved %s and %s", image_path, npz_path)
     finally:
         runtime.stop()
+
+
+if __name__ == "__main__":
+    main()
