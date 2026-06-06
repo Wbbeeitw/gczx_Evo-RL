@@ -97,7 +97,6 @@ class TactileSensorDriver(TactileSerialProtocol):
             raise RuntimeError("No supported tactile sensors detected on %s" % self.port)
         if self.enable_distributed:
             self.read_point_count_table()
-        self.flush_input()
         if not self.enable_auto_push_mode():
             raise RuntimeError("Failed to enable tactile auto-push mode on %s" % self.port)
 
