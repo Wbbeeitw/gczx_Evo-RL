@@ -105,17 +105,17 @@ class TactileCameraConfig(CameraConfig):
     calibration_reducer: str = "median"
 
     # CameraConfig overrides — tactile camera always produces images at
-    # (2*output_size, 2*output_size, 3).  fps/width/height from the base
-    # config are ignored; these are here for display only.
+    # (2*output_size, 2*output_size, 3).  These are set in __post_init__.
     fps: int | None = field(default=10, init=False, repr=False)
-    width: int | None = field(default=None, init=False, repr=False)
-    height: int | None = field(default=None, init=False, repr=False)
+    width: int | None = field(default=512, init=False, repr=False)
+    height: int | None = field(default=512, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Force camera properties to match the rendered image.
+        sz = self.output_size * 2
         object.__setattr__(self, "fps", 10)
-        object.__setattr__(self, "width", None)
-        object.__setattr__(self, "height", None)
+        object.__setattr__(self, "width", sz)
+        object.__setattr__(self, "height", sz)
 
         if self.read_mode not in {"auto_push", "distributed_poll"}:
             raise ValueError(f"Unsupported read_mode: {self.read_mode}")
