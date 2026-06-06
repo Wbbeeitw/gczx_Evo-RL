@@ -68,6 +68,7 @@ from lerobot.robots.bi_piper_follower import (
 from lerobot.robots.piper_follower import PiperFollowerConfigBase
 from lerobot.teleoperators import make_teleoperator_from_config
 from lerobot.teleoperators.bi_piper_leader import BiPiperLeaderConfig
+from lerobot.teleoperators.bi_piper_leader import BiPiperXLeaderConfig
 from lerobot.teleoperators.piper_leader import PiperLeaderConfigBase
 from lerobot.utils.constants import ACTION
 from lerobot.utils.control_utils import (
@@ -293,7 +294,8 @@ def main():
         ),
     )
 
-    teleop_cfg = BiPiperLeaderConfig(
+    teleop_cfg_cls = BiPiperXLeaderConfig if args.robot_type == "bi_piperx_follower" else BiPiperLeaderConfig
+    teleop_cfg = teleop_cfg_cls(
         id=args.teleop_id,
         left_arm_config=PiperLeaderConfigBase(
             port=args.left_leader_can,
