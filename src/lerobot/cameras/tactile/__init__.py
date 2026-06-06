@@ -16,5 +16,6 @@
 
 from .camera_tactile import TactileCamera
 from .configuration_tactile import TactileCameraConfig
+from .visualizer import TactileVisualizer
 
-__all__ = ["TactileCamera", "TactileCameraConfig"]
+__all__ = ["TactileCamera", "TactileCameraConfig", "TactileVisualizer"]
