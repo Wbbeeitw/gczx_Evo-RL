@@ -394,13 +394,23 @@ def main():
                         action = teleop.get_action()
                         robot.send_action(action)
 
-                        # Apply processors to match dataset schema
-                        # teleop_action_processor expects (action, observation) tuple
-                        processed_action = teleop_action_processor((action, obs))
-                        processed_obs = robot_observation_processor(obs)
-                        # Processors return flat dicts with dot-notation keys
-                        frame_data = {**processed_obs, **processed_action}
-                        frame_data["task"] = args.task
+                        # Build frame with dataset-expected dot-notation keys
+                        # observation.state: all motor values concatenated
+                        state_keys = robot._motors_ft
+                        state_vals = [float(obs[k]) for k in state_keys]
+                        action_vals = [float(action[k]) for k in state_keys]
+                        frame_data = {
+                            "observation.state": state_vals,
+                            "action": action_vals,
+                            "task": args.task,
+                        }
+                        # observation.images.*: camera/tactile images
+                        for cam_key in robot.cameras:
+                            if cam_key.startswith("left_"):
+                                img_key = f"observation.images.{cam_key}"
+                            else:
+                                img_key = f"observation.images.{cam_key}"
+                            frame_data[img_key] = obs[cam_key]
                         dataset.add_frame(frame_data)
                         frame_count += 1
 
