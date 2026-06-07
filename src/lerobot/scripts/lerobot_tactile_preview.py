@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=1.0)
     parser.add_argument("--mode", choices=("auto_push", "distributed_poll"), default="auto_push")
     parser.add_argument("--distributed-scale", type=float, default=0.1)
-    parser.add_argument("--output-size", type=int, default=256)
+    parser.add_argument("--output-size", type=int, default=64)
     parser.add_argument("--heatmap-vmin", type=float, default=0.0)
     parser.add_argument("--heatmap-vmax", type=float, default=25.5)
     parser.add_argument(

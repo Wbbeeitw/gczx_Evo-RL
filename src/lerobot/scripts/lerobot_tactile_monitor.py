@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("auto_push", "distributed_poll"), default="auto_push")
     parser.add_argument("--distributed-scale", type=float, default=0.1)
     parser.add_argument(
-        "--output-size", type=int, default=256, help="Rendered panel size for each tactile view."
+        "--output-size", type=int, default=64, help="Rendered panel size for each tactile view."
     )
     parser.add_argument(
         "--heatmap-vmin", type=float, default=0.0, help="Lower bound of the Fz heatmap range."
