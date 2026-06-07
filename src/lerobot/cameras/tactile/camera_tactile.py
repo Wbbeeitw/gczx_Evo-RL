@@ -155,7 +155,7 @@ class TactileCamera(Camera):
         return self.async_read()
 
     @check_if_not_connected
-    def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
+    def async_read(self, timeout_ms: float = 5000) -> NDArray[Any]:
         """Return the latest rendered frame, blocking if necessary."""
         if self._read_thread is None or not self._read_thread.is_alive():
             raise RuntimeError("TactileCamera read thread is not running.")
