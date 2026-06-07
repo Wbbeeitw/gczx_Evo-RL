@@ -405,12 +405,8 @@ def main():
                             "task": args.task,
                         }
                         # observation.images.*: camera/tactile images
-                        for cam_key in robot.cameras:
-                            if cam_key.startswith("left_"):
-                                img_key = f"observation.images.{cam_key}"
-                            else:
-                                img_key = f"observation.images.{cam_key}"
-                            frame_data[img_key] = obs[cam_key]
+                        for cam_key in robot._cameras_ft:
+                            frame_data[f"observation.images.{cam_key}"] = obs[cam_key]
                         dataset.add_frame(frame_data)
                         frame_count += 1
 
