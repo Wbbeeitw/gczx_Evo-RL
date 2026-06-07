@@ -398,9 +398,8 @@ def main():
                         # teleop_action_processor expects (action, observation) tuple
                         processed_action = teleop_action_processor((action, obs))
                         processed_obs = robot_observation_processor(obs)
-                        frame_data = combine_feature_dicts(
-                            observation=processed_obs, action=processed_action
-                        )
+                        # Processors return flat dicts with dot-notation keys
+                        frame_data = {**processed_obs, **processed_action}
                         frame_data["task"] = args.task
                         dataset.add_frame(frame_data)
                         frame_count += 1
