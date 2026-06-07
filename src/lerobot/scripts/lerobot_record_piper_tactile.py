@@ -397,8 +397,9 @@ def main():
                         # Build frame with dataset-expected dot-notation keys
                         # observation.state: all motor values concatenated
                         state_keys = robot._motors_ft
-                        state_vals = [float(obs[k]) for k in state_keys]
-                        action_vals = [float(action[k]) for k in state_keys]
+                        import numpy as np
+                        state_vals = np.array([float(obs[k]) for k in state_keys], dtype=np.float32)
+                        action_vals = np.array([float(action[k]) for k in state_keys], dtype=np.float32)
                         frame_data = {
                             "observation.state": state_vals,
                             "action": action_vals,
