@@ -157,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ego-camera-side", choices=("left", "right"), default="left")
     parser.add_argument("--missing-left-wrist-fill", choices=("black", "copy-ego", "copy-right-wrist"),
                         default="black")
-    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--camera-warmup-s", type=int, default=2)
     # Tactile
@@ -165,7 +165,7 @@ def parse_args() -> argparse.Namespace:
                         help="Serial port for left tactile controller.")
     parser.add_argument("--right-tactile-port", type=str, default=None,
                         help="Serial port for right tactile controller.")
-    parser.add_argument("--tactile-output-size", type=int, default=64)
+    parser.add_argument("--tactile-output-size", type=int, default=256)
     parser.add_argument("--tactile-heatmap-vmin", type=float, default=0.0)
     parser.add_argument("--tactile-heatmap-vmax", type=float, default=25.5)
     parser.add_argument("--tactile-colormap", type=str, default="turbo")

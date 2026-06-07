@@ -89,7 +89,7 @@ class TactileCameraConfig(CameraConfig):
     distributed_scale: float = 0.1
 
     # --- Visualisation ---
-    output_size: int = 64
+    output_size: int = 256
     heatmap_vmin: float = 0.0
     heatmap_vmax: float = 25.5
     heatmap_colormap: str = "turbo"
