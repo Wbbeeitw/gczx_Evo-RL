@@ -395,8 +395,9 @@ def main():
                         robot.send_action(action)
 
                         # Apply processors to match dataset schema
+                        # teleop_action_processor expects (action, observation) tuple
+                        processed_action = teleop_action_processor((action, obs))
                         processed_obs = robot_observation_processor(obs)
-                        processed_action = teleop_action_processor(action)
                         dataset.add_frame({**{"observation": processed_obs}, **{"action": processed_action}})
                         frame_count += 1
 
