@@ -156,20 +156,24 @@ class TactileCamera(Camera):
 
     @check_if_not_connected
     def async_read(self, timeout_ms: float = 5000) -> NDArray[Any]:
-        """Return the latest rendered frame, blocking if necessary."""
+        """Return the latest rendered frame. Non-blocking: returns cached frame immediately."""
         if self._read_thread is None or not self._read_thread.is_alive():
             raise RuntimeError("TactileCamera read thread is not running.")
 
-        if not self._new_frame_event.wait(timeout=timeout_ms / 1000.0):
-            raise TimeoutError(
-                f"TactileCamera({self.config.port}): timed out waiting for frame "
-                f"after {timeout_ms} ms."
-            )
-
+        # Return latest frame immediately (non-blocking)
         with self._frame_lock:
             frame = self._latest_frame
-            self._new_frame_event.clear()
+        if frame is not None:
+            return frame
 
+        # First call — wait for initial frame
+        if not self._new_frame_event.wait(timeout=timeout_ms / 1000.0):
+            raise TimeoutError(
+                f"TactileCamera({self.config.port}): timed out waiting for initial frame "
+                f"after {timeout_ms} ms."
+            )
+        with self._frame_lock:
+            frame = self._latest_frame
         if frame is None:
             raise RuntimeError(
                 f"TactileCamera({self.config.port}): event set but no frame available."
@@ -241,10 +245,18 @@ class TactileCamera(Camera):
         assert self._stop_event is not None
 
         failure_count = 0
+        last_rendered_ts: float = 0.0
+        render_interval = 1.0 / 15.0  # throttle rendering to 15fps
+
         while not self._stop_event.is_set():
             try:
                 snapshot = self._runtime.get_snapshot(copy_snapshot=True)
                 if snapshot is None:
+                    time.sleep(0.01)
+                    continue
+
+                # Skip rendering if sensor frame hasn't changed
+                if snapshot.frame.timestamp <= last_rendered_ts:
                     time.sleep(0.01)
                     continue
 
@@ -255,7 +267,9 @@ class TactileCamera(Camera):
                 with self._frame_lock:
                     self._latest_frame = rgb
                 self._new_frame_event.set()
+                last_rendered_ts = snapshot.frame.timestamp
                 failure_count = 0
+                time.sleep(render_interval)
 
             except Exception as exc:
                 failure_count += 1
