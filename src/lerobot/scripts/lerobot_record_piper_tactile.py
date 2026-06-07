@@ -428,40 +428,40 @@ def main():
                             frame_queue.put(frame_data)
                             frame_count += 1
 
-                        elapsed = time.perf_counter() - start_t
-                        print(
-                            f"\r  frames={frame_count:05d} elapsed={elapsed:.1f}s",
-                            end="", flush=True,
-                        )
+                            elapsed = time.perf_counter() - start_t
+                            print(
+                                f"\r  frames={frame_count:05d} elapsed={elapsed:.1f}s",
+                                end="", flush=True,
+                            )
 
-                        # Check keyboard
-                        key = read_key_nonblocking() if interactive else None
-                        if key in ("\r", "\n"):
-                            break
-                        if key:
-                            k = key.lower()
-                            if k == "s":
-                                outcome = "success"; break
-                            if k == "f":
-                                outcome = "failure"; break
-                            if k == "o":
-                                outcome = "ongoing"; break
-                            if k == "d":
-                                outcome = "discard"; break
-                            if k == "q":
-                                outcome = "quit"; quit_session = True; break
+                            # Check keyboard
+                            key = read_key_nonblocking() if interactive else None
+                            if key in ("\r", "\n"):
+                                break
+                            if key:
+                                k = key.lower()
+                                if k == "s":
+                                    outcome = "success"; break
+                                if k == "f":
+                                    outcome = "failure"; break
+                                if k == "o":
+                                    outcome = "ongoing"; break
+                                if k == "d":
+                                    outcome = "discard"; break
+                                if k == "q":
+                                    outcome = "quit"; quit_session = True; break
 
-                        if args.episode_seconds > 0 and elapsed >= args.episode_seconds:
-                            break
+                            if args.episode_seconds > 0 and elapsed >= args.episode_seconds:
+                                break
 
-                        # Frame pacing
-                        next_t = start_t + (frame_count + 1) * frame_period
-                        sleep_s = next_t - time.perf_counter()
-                        if sleep_s > 0:
-                            time.sleep(sleep_s)
-                        elif time.perf_counter() - loop_t > frame_period * 2:
-                            # Resync if we're falling behind
-                            start_t = time.perf_counter() - frame_count * frame_period
+                            # Frame pacing
+                            next_t = start_t + (frame_count + 1) * frame_period
+                            sleep_s = next_t - time.perf_counter()
+                            if sleep_s > 0:
+                                time.sleep(sleep_s)
+                            elif time.perf_counter() - loop_t > frame_period * 2:
+                                # Resync if we're falling behind
+                                start_t = time.perf_counter() - frame_count * frame_period
 
                 finally:
                     write_done.set()
