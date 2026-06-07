@@ -157,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ego-camera-side", choices=("left", "right"), default="left")
     parser.add_argument("--missing-left-wrist-fill", choices=("black", "copy-ego", "copy-right-wrist"),
                         default="black")
-    parser.add_argument("--width", type=int, default=2560)
+    parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--camera-warmup-s", type=int, default=2)
     # Tactile
