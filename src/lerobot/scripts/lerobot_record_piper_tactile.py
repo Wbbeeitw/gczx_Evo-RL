@@ -75,6 +75,10 @@ from lerobot.utils.control_utils import (
     sanity_check_bimanual_piper_pair,
     sanity_check_dataset_name,
 )
+import threading
+import numpy as np
+from queue import Queue
+
 from lerobot.utils.utils import init_logging
 
 
@@ -386,30 +390,43 @@ def main():
                     f"  Recording episode {episode_index:03d}. "
                     "Keys: ENTER=end+prompt, s=success, f=failure, o=ongoing, d=discard, q=quit."
                 )
-                with cbreak_stdin(interactive):
-                    while True:
-                        loop_t = time.perf_counter()
+                # Offload dataset writes to background thread for smooth teleop
+                state_keys = list(robot._motors_ft.keys())
+                cam_keys = list(robot._cameras_ft.keys())
+                frame_queue: Queue = Queue()
+                write_done = threading.Event()
 
-                        obs = robot.get_observation()
-                        action = teleop.get_action()
-                        robot.send_action(action)
+                def _writer():
+                    while not write_done.is_set():
+                        item = frame_queue.get()
+                        if item is None:
+                            break
+                        dataset.add_frame(item)
 
-                        # Build frame with dataset-expected dot-notation keys
-                        # observation.state: all motor values concatenated
-                        state_keys = robot._motors_ft
-                        import numpy as np
-                        state_vals = np.array([float(obs[k]) for k in state_keys], dtype=np.float32)
-                        action_vals = np.array([float(action[k]) for k in state_keys], dtype=np.float32)
-                        frame_data = {
-                            "observation.state": state_vals,
-                            "action": action_vals,
-                            "task": args.task,
-                        }
-                        # observation.images.*: camera/tactile images
-                        for cam_key in robot._cameras_ft:
-                            frame_data[f"observation.images.{cam_key}"] = obs[cam_key]
-                        dataset.add_frame(frame_data)
-                        frame_count += 1
+                writer_thread = threading.Thread(target=_writer, name="frame-writer", daemon=True)
+                writer_thread.start()
+
+                try:
+                    with cbreak_stdin(interactive):
+                        while True:
+                            loop_t = time.perf_counter()
+
+                            obs = robot.get_observation()
+                            action = teleop.get_action()
+                            robot.send_action(action)
+
+                            # Build frame (fast path)
+                            state_vals = np.array([float(obs[k]) for k in state_keys], dtype=np.float32)
+                            action_vals = np.array([float(action[k]) for k in state_keys], dtype=np.float32)
+                            frame_data = {
+                                "observation.state": state_vals,
+                                "action": action_vals,
+                                "task": args.task,
+                            }
+                            for ck in cam_keys:
+                                frame_data[f"observation.images.{ck}"] = obs[ck]
+                            frame_queue.put(frame_data)
+                            frame_count += 1
 
                         elapsed = time.perf_counter() - start_t
                         print(
@@ -445,6 +462,11 @@ def main():
                         elif time.perf_counter() - loop_t > frame_period * 2:
                             # Resync if we're falling behind
                             start_t = time.perf_counter() - frame_count * frame_period
+
+                finally:
+                    write_done.set()
+                    frame_queue.put(None)
+                    writer_thread.join(timeout=5.0)
 
                 print()  # newline after \r
 
