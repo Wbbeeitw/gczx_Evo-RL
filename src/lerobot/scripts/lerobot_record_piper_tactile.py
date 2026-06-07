@@ -374,9 +374,7 @@ def main():
             while True:
                 input(f"\nPress ENTER to start episode {episode_index:03d} ...")
 
-                # Start new episode in the dataset
-                dataset.start_episode()
-
+                # Episode is started implicitly by the first add_frame()
                 frame_count = 0
                 start_t = time.perf_counter()
                 frame_period = 1.0 / float(args.fps)
@@ -396,7 +394,10 @@ def main():
                         action = teleop.get_action()
                         robot.send_action(action)
 
-                        dataset.add_frame({"observation": obs, "action": action})
+                        # Apply processors to match dataset schema
+                        processed_obs = robot_observation_processor(obs)
+                        processed_action = teleop_action_processor(action)
+                        dataset.add_frame({**{"observation": processed_obs}, **{"action": processed_action}})
                         frame_count += 1
 
                         elapsed = time.perf_counter() - start_t
