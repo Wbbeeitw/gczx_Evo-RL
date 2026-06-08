@@ -805,7 +805,7 @@ class XR0Model(nn.Module):
         vlm_kwargs = self._prepare_vlm_inputs(batch)
 
         # Extract and pad action
-        action = batch[ACTION]
+        action = batch[ACTION].to(self._dtype)
         action = pad_vector(action, self.config.max_action_dim)
         action_bs, action_length, _ = action.shape
 
