@@ -998,7 +998,7 @@ class XR0Policy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().float().numpy().tolist(),
         }
 
         if reduction == "none":
