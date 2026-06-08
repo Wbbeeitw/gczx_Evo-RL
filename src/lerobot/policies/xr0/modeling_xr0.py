@@ -366,7 +366,7 @@ class XR0Model(nn.Module):
 
             self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
                 config.qwen_variant,
-                attn_implementation="flash_attention_2",
+                attn_implementation="sdpa",
                 torch_dtype=self._dtype,
             )
         except ImportError:
@@ -375,7 +375,7 @@ class XR0Model(nn.Module):
 
             self.vlm = AutoModelForVision2Seq.from_pretrained(
                 config.qwen_variant,
-                attn_implementation="flash_attention_2",
+                attn_implementation="sdpa",
                 torch_dtype=self._dtype,
                 trust_remote_code=True,
             )
