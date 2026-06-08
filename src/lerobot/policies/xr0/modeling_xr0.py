@@ -828,7 +828,7 @@ class XR0Model(nn.Module):
         )
 
         # ---- Project state ----
-        state_embed = self.state_projector(state)
+        state_embed = self.state_projector(state.to(self.dtype))
 
         # ---- Rectified flow training ----
         noise = torch.randn_like(action)
@@ -925,7 +925,7 @@ class XR0Model(nn.Module):
         )
 
         # ---- Project state ----
-        state_embed = self.state_projector(state)
+        state_embed = self.state_projector(state.to(self.dtype))
 
         # ---- Denoise via Euler integration ----
         z = torch.randn(bs, action_length, self.config.max_action_dim, device=device, dtype=self._dtype)
