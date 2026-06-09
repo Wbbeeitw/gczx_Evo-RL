@@ -1019,11 +1019,26 @@ class XR0Policy(PreTrainedPolicy):
         """Select a single action given environment observations.
 
         Uses action chunk queue: when empty, runs full inference and fills queue.
+        Converts predicted absolute joint positions to deltas for Piper.
         """
         self.eval()
 
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            # actions: (B, n_action_steps, max_action_dim=32)
+            # XR0 predicts ABSOLUTE joint positions, but Piper expects DELTAs.
+            # Convert: delta = predicted_absolute - current_state
+            state = batch.get(ACTION, None)
+            if state is None:
+                state = batch.get("observation.state", batch.get("action"))
+            if state is not None and state.shape[-1] >= 14:
+                # First 14 dims are joint positions (7 left + 7 right)
+                actions[:, :, :14] = actions[:, :, :14] - state[:, :14].unsqueeze(1)
+            # Safety: clamp joint deltas to reasonable range
+            actions[:, :, :6].clamp_(-3.0, 3.0)          # left joints
+            actions[:, :, 7:13].clamp_(-3.0, 3.0)        # right joints
+            actions[:, :, 6].clamp_(-5.0, 5.0)           # left gripper
+            actions[:, :, 13].clamp_(-5.0, 5.0)          # right gripper
             # (B, n_action_steps, D) → transpose to fill queue as (n_action_steps, B, D)
             self._action_queue.extend(actions.transpose(0, 1))
 
