@@ -1011,6 +1011,10 @@ class XR0Policy(PreTrainedPolicy):
             return loss, loss_dict
 
     @torch.no_grad()
+    def predict_action(self, batch: dict[str, Tensor]) -> Tensor:
+        """Alias for select_action — predict action from observation."""
+        return self.select_action(batch)
+
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
