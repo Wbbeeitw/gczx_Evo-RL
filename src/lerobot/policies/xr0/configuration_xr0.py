@@ -105,6 +105,14 @@ class XR0Config(PreTrainedConfig):
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
+        # Convert raw dict entries to PolicyFeature objects (needed when loading from JSON)
+        for key, ft in list(self.input_features.items()):
+            if isinstance(ft, dict):
+                self.input_features[key] = PolicyFeature(**ft)
+        for key, ft in list(self.output_features.items()):
+            if isinstance(ft, dict):
+                self.output_features[key] = PolicyFeature(**ft)
+
         if OBS_STATE not in self.input_features:
             state_feature = PolicyFeature(
                 type=FeatureType.STATE,
