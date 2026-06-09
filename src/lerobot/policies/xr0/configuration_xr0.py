@@ -86,6 +86,7 @@ class XR0Config(PreTrainedConfig):
     # Optional stats file with action mean/std shaped (chunk_size, 32).
     xr0_stats_path: str | None = None
     action_layout: str = "aloha14"  # "aloha14" or "xr0_32"
+    controlled_arms: str = "both"  # "both", "left", or "right"
     actions_are_delta: bool = False
 
     # === Optimizer settings (same as PI05) ===
@@ -123,6 +124,9 @@ class XR0Config(PreTrainedConfig):
 
         if self.action_layout not in ["aloha14", "xr0_32"]:
             raise ValueError("action_layout must be 'aloha14' or 'xr0_32'.")
+
+        if self.controlled_arms not in ["both", "left", "right"]:
+            raise ValueError("controlled_arms must be 'both', 'left', or 'right'.")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

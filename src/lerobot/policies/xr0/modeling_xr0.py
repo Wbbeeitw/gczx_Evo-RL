@@ -27,7 +27,7 @@ from torch import Tensor
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.xr0.configuration_xr0 import XR0Config
 from lerobot.policies.xr0.native import XR0 as NativeXR0
-from lerobot.policies.xr0.processor_xr0 import load_xr0_action_stats
+from lerobot.policies.xr0.processor_xr0 import _xr0_action_mask, load_xr0_action_stats
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 logger = logging.getLogger(__name__)
@@ -277,7 +277,12 @@ class XR0Policy(PreTrainedPolicy):
             native_batch["action"] = batch[ACTION].to(self.device)
             action_mask = batch.get("action_mask")
             if action_mask is None:
-                action_mask = torch.ones_like(native_batch["action"], dtype=torch.int32)
+                action_mask = self._make_action_mask(
+                    native_batch["action"].shape[0],
+                    native_batch["action"].shape[1],
+                    device=self.device,
+                    dtype=torch.int32,
+                )
             native_batch["action_mask"] = action_mask.to(self.device)
         elif not include_action:
             batch_size = (
@@ -292,12 +297,34 @@ class XR0Policy(PreTrainedPolicy):
                 device=self.device,
                 dtype=torch.bfloat16 if self.config.dtype == "bfloat16" else torch.float32,
             )
-            native_batch["action_mask"] = torch.ones_like(native_batch["action"], dtype=torch.int32)
+            native_batch["action_mask"] = self._make_action_mask(
+                batch_size,
+                self.config.chunk_size,
+                device=self.device,
+                dtype=torch.int32,
+            )
 
         if "prefix_length" in batch:
             native_batch["prefix_length"] = batch["prefix_length"]
 
         return native_batch
+
+    def _make_action_mask(
+        self,
+        batch_size: int,
+        horizon: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        return _xr0_action_mask(
+            batch_size,
+            horizon,
+            action_layout=self.config.action_layout,
+            controlled_arms=self.config.controlled_arms,
+            device=device,
+            dtype=dtype,
+        )
 
     def _unnormalize_native_action(self, action: Tensor) -> Tensor:
         if not bool(self._xr0_action_stats_loaded.item()):
@@ -312,6 +339,24 @@ class XR0Policy(PreTrainedPolicy):
         if state.ndim == 2:
             state = state.unsqueeze(1)
         return action + state.to(device=action.device, dtype=action.dtype)
+
+    def _hold_uncontrolled_action_dims(self, action: Tensor, state: Tensor) -> Tensor:
+        control_mask = self._make_action_mask(
+            action.shape[0],
+            action.shape[1],
+            device=action.device,
+            dtype=torch.bool,
+        )
+        if torch.all(control_mask):
+            return action
+
+        if self.config.actions_are_delta:
+            fallback = torch.zeros_like(action)
+        else:
+            if state.ndim == 2:
+                state = state.unsqueeze(1)
+            fallback = state.to(device=action.device, dtype=action.dtype).expand(-1, action.shape[1], -1)
+        return torch.where(control_mask, action, fallback)
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         native_batch = self._prepare_native_batch(batch, include_action=True)
@@ -350,6 +395,7 @@ class XR0Policy(PreTrainedPolicy):
         actions = self.model.generate(native_batch)
         actions = self._unnormalize_native_action(actions)
         actions = self._restore_absolute_action(actions, state)
+        actions = self._hold_uncontrolled_action_dims(actions, state)
         return actions[:, :, : self.config.max_action_dim]
 
     def _get_default_peft_targets(self) -> dict:

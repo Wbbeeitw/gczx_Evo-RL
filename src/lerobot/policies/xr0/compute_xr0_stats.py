@@ -4,7 +4,8 @@
 
 The output is meant to be passed to ``XR0Config.xr0_stats_path``. For ALOHA
 datasets this script packs 14D actions into Xiaomi's native 32D layout and,
-by default, converts absolute future joint targets into XR0-style deltas.
+by default, converts absolute future joint targets into XR0-style deltas. Use
+``--controlled-arms right`` for datasets where only the right arm moves.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ def compute_xr0_stats(
     output: Path,
     horizon: int,
     action_layout: str,
+    controlled_arms: str,
     actions_are_delta: bool,
     episodes: list[int] | None,
     revision: str | None,
@@ -83,6 +85,7 @@ def compute_xr0_stats(
         1,
         horizon,
         action_layout=action_layout,
+        controlled_arms=controlled_arms,
         device=torch.device("cpu"),
         dtype=torch.bool,
     )[0]
@@ -133,6 +136,7 @@ def compute_xr0_stats(
             "root": str(root) if root is not None else None,
             "horizon": horizon,
             "action_layout": action_layout,
+            "controlled_arms": controlled_arms,
             "actions_are_delta": actions_are_delta,
             "episodes": episodes,
             "stride": stride,
@@ -153,6 +157,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path, help="Where to write xr0_stats.pt.")
     parser.add_argument("--horizon", type=int, default=30)
     parser.add_argument("--action-layout", choices=["aloha14", "xr0_32"], default="aloha14")
+    parser.add_argument("--controlled-arms", choices=["both", "left", "right"], default="both")
     parser.add_argument("--actions-are-delta", action="store_true")
     parser.add_argument("--episodes", nargs="*", default=None, help="Optional episode ids, space or comma separated.")
     parser.add_argument("--revision", default=None)
@@ -168,6 +173,7 @@ def main() -> None:
         output=args.output,
         horizon=args.horizon,
         action_layout=args.action_layout,
+        controlled_arms=args.controlled_arms,
         actions_are_delta=args.actions_are_delta,
         episodes=_parse_episodes(args.episodes),
         revision=args.revision,
@@ -180,6 +186,7 @@ def main() -> None:
     print(f"wrote: {args.output}")
     print(f"mean shape: {tuple(stats['mean'].shape)}")
     print(f"std shape: {tuple(stats['std'].shape)}")
+    print(f"controlled arms: {payload['meta']['controlled_arms']}")
     print(f"used samples: {payload['meta']['used_samples']}")
 
 

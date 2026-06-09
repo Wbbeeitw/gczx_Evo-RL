@@ -49,6 +49,9 @@ RIGHT_GRIPPER = slice(20, 21)
 RIGHT_JOINTS = slice(21, 27)
 
 XR0_CONTROL_SLICES = (LEFT_JOINTS, LEFT_GRIPPER, RIGHT_JOINTS, RIGHT_GRIPPER)
+XR0_LEFT_ARM_SLICES = (LEFT_JOINTS, LEFT_GRIPPER)
+XR0_RIGHT_ARM_SLICES = (RIGHT_JOINTS, RIGHT_GRIPPER)
+CONTROLLED_ARMS = ("both", "left", "right")
 
 
 def _as_tensor(value: Any, *, dtype: torch.dtype | None = torch.float32) -> torch.Tensor:
@@ -135,13 +138,25 @@ def _xr0_action_mask(
     horizon: int,
     *,
     action_layout: str,
+    controlled_arms: str = "both",
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    if action_layout == "xr0_32":
+    if controlled_arms not in CONTROLLED_ARMS:
+        raise ValueError("controlled_arms must be 'both', 'left', or 'right'.")
+    if action_layout not in {"aloha14", "xr0_32"}:
+        raise ValueError("action_layout must be 'aloha14' or 'xr0_32'.")
+
+    if action_layout == "xr0_32" and controlled_arms == "both":
         return torch.ones(batch_size, horizon, XR0_DIM, device=device, dtype=dtype)
+
+    control_slices = {
+        "both": XR0_CONTROL_SLICES,
+        "left": XR0_LEFT_ARM_SLICES,
+        "right": XR0_RIGHT_ARM_SLICES,
+    }[controlled_arms]
     mask = torch.zeros(batch_size, horizon, XR0_DIM, device=device, dtype=dtype)
-    for slc in XR0_CONTROL_SLICES:
+    for slc in control_slices:
         mask[..., slc] = 1
     return mask
 
@@ -222,6 +237,7 @@ class PackXR0ActionLayoutStep(ProcessorStep):
 
     action_layout: str = "aloha14"
     horizon: int = 30
+    controlled_arms: str = "both"
     actions_are_delta: bool = False
     stats: dict[str, dict[str, Any]] | None = None
     eps: float = 1e-6
@@ -232,6 +248,8 @@ class PackXR0ActionLayoutStep(ProcessorStep):
     def __post_init__(self) -> None:
         if self.action_layout not in {"aloha14", "xr0_32"}:
             raise ValueError("action_layout must be 'aloha14' or 'xr0_32'.")
+        if self.controlled_arms not in CONTROLLED_ARMS:
+            raise ValueError("controlled_arms must be 'both', 'left', or 'right'.")
         self._load_stats(self.stats)
 
     def _load_stats(self, stats: dict[str, dict[str, Any]] | None) -> None:
@@ -287,6 +305,7 @@ class PackXR0ActionLayoutStep(ProcessorStep):
                 action32.shape[0],
                 self.horizon,
                 action_layout=self.action_layout,
+                controlled_arms=self.controlled_arms,
                 device=action32.device,
                 dtype=action32.dtype,
             )
@@ -307,6 +326,7 @@ class PackXR0ActionLayoutStep(ProcessorStep):
         return {
             "action_layout": self.action_layout,
             "horizon": self.horizon,
+            "controlled_arms": self.controlled_arms,
             "actions_are_delta": self.actions_are_delta,
             "eps": self.eps,
         }
@@ -401,6 +421,7 @@ def make_xr0_pre_post_processors(
         PackXR0ActionLayoutStep(
             action_layout=config.action_layout,
             horizon=config.chunk_size,
+            controlled_arms=config.controlled_arms,
             actions_are_delta=config.actions_are_delta,
             stats=xr0_action_stats,
         ),
