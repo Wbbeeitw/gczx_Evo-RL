@@ -19,6 +19,21 @@ from lerobot.policies.xr0.configuration_xr0 import XR0Config
 from lerobot.policies.xr0.native import XR0 as NativeXR0
 
 
+def _remap_official_checkpoint_key(key: str) -> str:
+    """Map Xiaomi's converted checkpoint keys to the native LeRobot XR0 module."""
+
+    for prefix in ("_forward_module.model.", "module.model."):
+        if key.startswith(prefix):
+            key = "model." + key.removeprefix(prefix)
+            break
+
+    if key.startswith("model.model."):
+        return "vlm.model." + key.removeprefix("model.model.")
+    if key.startswith("model."):
+        return key.removeprefix("model.")
+    return key
+
+
 def _load_official_state_dict(path: Path) -> dict[str, torch.Tensor]:
     payload = torch.load(path, map_location="cpu")
     if "module" in payload:
@@ -30,11 +45,7 @@ def _load_official_state_dict(path: Path) -> dict[str, torch.Tensor]:
 
     out = {}
     for key, value in state_dict.items():
-        if key.startswith("model."):
-            key = key.removeprefix("model.")
-        elif key.startswith("_forward_module.model."):
-            key = key.removeprefix("_forward_module.model.")
-        out[key] = value
+        out[_remap_official_checkpoint_key(key)] = value
     return out
 
 

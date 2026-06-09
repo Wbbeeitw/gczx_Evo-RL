@@ -33,6 +33,21 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 logger = logging.getLogger(__name__)
 
 
+def _remap_official_checkpoint_key(key: str) -> str:
+    """Map Xiaomi's converted checkpoint keys to the native LeRobot XR0 module."""
+
+    for prefix in ("_forward_module.model.", "module.model."):
+        if key.startswith(prefix):
+            key = "model." + key.removeprefix(prefix)
+            break
+
+    if key.startswith("model.model."):
+        return "vlm.model." + key.removeprefix("model.model.")
+    if key.startswith("model."):
+        return key.removeprefix("model.")
+    return key
+
+
 class XR0Policy(PreTrainedPolicy):
     """LeRobot policy adapter for the official XR0 VLA model."""
 
@@ -126,12 +141,7 @@ class XR0Policy(PreTrainedPolicy):
 
         remapped = {}
         for key, value in state_dict.items():
-            if key.startswith("model."):
-                remapped[key.removeprefix("model.")] = value
-            elif key.startswith("_forward_module.model."):
-                remapped[key.removeprefix("_forward_module.model.")] = value
-            else:
-                remapped[key] = value
+            remapped[_remap_official_checkpoint_key(key)] = value
 
         info = self.model.load_state_dict(remapped, strict=False)
         logger.info("Loaded official XR0 checkpoint from %s: %s", path, info)
