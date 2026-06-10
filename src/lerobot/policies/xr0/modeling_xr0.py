@@ -32,6 +32,18 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_IMAGE_DESCRIPTIONS = {
+    "observation.images.left_wrist": "left wrist RGB camera view",
+    "observation.images.left_ego": "base or front RGB camera view",
+    "observation.images.right_wrist": "right wrist RGB camera view",
+    "observation.images.left_tactile": (
+        "left wrist tactile heatmap showing contact force distribution"
+    ),
+    "observation.images.right_tactile": (
+        "right wrist tactile heatmap showing contact force distribution"
+    ),
+}
+
 
 def _remap_official_checkpoint_key(key: str) -> str:
     """Map Xiaomi's converted checkpoint keys to the native LeRobot XR0 module."""
@@ -161,7 +173,25 @@ class XR0Policy(PreTrainedPolicy):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
 
     def _get_image_keys(self) -> list[str]:
-        return sorted(self.config.image_features.keys())
+        available_keys = set(self.config.image_features.keys())
+        if self.config.image_key_order:
+            missing_keys = [key for key in self.config.image_key_order if key not in available_keys]
+            if missing_keys:
+                raise ValueError(
+                    "XR0 image_key_order contains keys not found in dataset features: "
+                    f"{missing_keys}. Available image keys: {sorted(available_keys)}"
+                )
+            unused_keys = sorted(available_keys - set(self.config.image_key_order))
+            if unused_keys:
+                logger.warning("XR0 will ignore image keys not listed in image_key_order: %s", unused_keys)
+            return list(self.config.image_key_order)
+        return sorted(available_keys)
+
+    def _get_image_description(self, image_key: str) -> str:
+        return self.config.image_key_descriptions.get(
+            image_key,
+            DEFAULT_IMAGE_DESCRIPTIONS.get(image_key, image_key),
+        )
 
     def _tensor_to_image(self, image: Tensor) -> np.ndarray:
         image = image.detach().cpu()
@@ -225,11 +255,12 @@ class XR0Policy(PreTrainedPolicy):
         messages = []
         for batch_index in range(batch_size):
             content = []
-            for image_key in image_keys:
+            for image_index, image_key in enumerate(image_keys, start=1):
                 image = batch[image_key]
                 if isinstance(image, Tensor) and image.ndim == 4:
                     image = image[batch_index]
-                content.append({"type": "text", "text": f"\n# {image_key}\n"})
+                description = self._get_image_description(image_key).rstrip(".")
+                content.append({"type": "text", "text": f"\nImage {image_index}: {description}.\n"})
                 content.append({"type": "image", "image": self._tensor_to_image(image)})
             content.append({"type": "text", "text": f"Generate robot actions for the task:\n{tasks[batch_index]}"})
             messages.append(

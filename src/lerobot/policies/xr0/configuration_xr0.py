@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -66,6 +67,12 @@ class XR0Config(PreTrainedConfig):
     # This is the image resolution we resize to before passing to the processor.
     image_min_pixels: int = 256 * 28 * 28
     image_max_pixels: int = 1280 * 28 * 28
+    # Optional ordered whitelist of visual inputs. If omitted, all visual
+    # features are used in sorted key order.
+    image_key_order: list[str] | None = None
+    # Optional natural-language descriptions injected before each image in the
+    # Qwen prompt, keyed by LeRobot image feature name.
+    image_key_descriptions: dict[str, str] = field(default_factory=dict)
 
     # === Normalization ===
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -127,6 +134,42 @@ class XR0Config(PreTrainedConfig):
 
         if self.controlled_arms not in ["both", "left", "right"]:
             raise ValueError("controlled_arms must be 'both', 'left', or 'right'.")
+
+        if isinstance(self.image_key_order, str):
+            self.image_key_order = self._parse_image_key_order(self.image_key_order)
+        if isinstance(self.image_key_descriptions, str):
+            self.image_key_descriptions = self._parse_image_key_descriptions(
+                self.image_key_descriptions
+            )
+
+        if self.image_key_order is not None:
+            if not all(isinstance(key, str) for key in self.image_key_order):
+                raise ValueError("image_key_order must contain only strings.")
+            if len(set(self.image_key_order)) != len(self.image_key_order):
+                raise ValueError("image_key_order contains duplicate keys.")
+
+        if not isinstance(self.image_key_descriptions, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in self.image_key_descriptions.items()
+        ):
+            raise ValueError("image_key_descriptions must be a dict[str, str].")
+
+    @staticmethod
+    def _parse_image_key_order(value: str) -> list[str]:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = [part.strip() for part in value.split(",") if part.strip()]
+        if not isinstance(parsed, list):
+            raise ValueError("image_key_order must be a JSON list or comma-separated string.")
+        return [str(item) for item in parsed]
+
+    @staticmethod
+    def _parse_image_key_descriptions(value: str) -> dict[str, str]:
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("image_key_descriptions must be a JSON object.")
+        return {str(key): str(description) for key, description in parsed.items()}
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
