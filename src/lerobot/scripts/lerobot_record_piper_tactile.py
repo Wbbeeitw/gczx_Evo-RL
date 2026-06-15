@@ -195,6 +195,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset.push_to_hub", action="store_true", default=False, dest="push_to_hub")
     parser.add_argument("--dataset.private", action="store_true", default=False, dest="private_ds")
     parser.add_argument("--dataset.vcodec", type=str, default="h264", dest="vcodec")
+    parser.add_argument(
+        "--save-mode",
+        choices=("serial", "parallel"),
+        default="serial",
+        help=(
+            "How aggressively to save image/video data. "
+            "'serial' uses one image writer thread and encodes camera videos one by one for stability; "
+            "'parallel' restores the faster multi-thread/multi-process behavior."
+        ),
+    )
+    parser.add_argument(
+        "--image-writer-threads",
+        type=int,
+        default=None,
+        help=(
+            "Override image writer thread count. Defaults to 1 in serial mode, "
+            "or 4 threads per camera in parallel mode."
+        ),
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
 
@@ -357,6 +376,22 @@ def main():
         ),
     )
 
+    num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 1
+    if args.image_writer_threads is None:
+        image_writer_threads = 1 if args.save_mode == "serial" else 4 * num_cameras
+    else:
+        image_writer_threads = args.image_writer_threads
+    if image_writer_threads < 1:
+        raise ValueError("--image-writer-threads must be >= 1.")
+
+    parallel_video_encoding = args.save_mode == "parallel"
+    logger.info(
+        "Dataset save mode=%s image_writer_threads=%d parallel_video_encoding=%s",
+        args.save_mode,
+        image_writer_threads,
+        parallel_video_encoding,
+    )
+
     dataset = LeRobotDataset.create(
         args.dataset_repo_id,
         args.fps,
@@ -365,7 +400,7 @@ def main():
         features=dataset_features,
         use_videos=True,
         image_writer_processes=0,
-        image_writer_threads=4 * len(robot.cameras) if hasattr(robot, "cameras") else 4,
+        image_writer_threads=image_writer_threads,
         batch_encoding_size=1,
         vcodec=args.vcodec,
     )
@@ -507,7 +542,10 @@ def main():
                 # Save
                 ep_success = True if outcome == "success" else False
                 extra_meta = {"episode_success": ep_success} if outcome in ("success", "failure") else {}
-                dataset.save_episode(extra_episode_metadata=extra_meta if extra_meta else None)
+                dataset.save_episode(
+                    parallel_encoding=parallel_video_encoding,
+                    extra_episode_metadata=extra_meta if extra_meta else None,
+                )
                 saved_count += 1
                 logger.info(
                     "  Saved episode %03d as '%s' (%d frames).",
