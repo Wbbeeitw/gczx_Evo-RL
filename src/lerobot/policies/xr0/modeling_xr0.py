@@ -44,6 +44,33 @@ DEFAULT_IMAGE_DESCRIPTIONS = {
     ),
 }
 
+DEFAULT_IMAGE_VIEW_HEADINGS = {
+    "observation.images.left_ego": "Base View",
+    "observation.images.left_wrist": "Left-Wrist View",
+    "observation.images.right_wrist": "Right-Wrist View",
+    "observation.images.left_tactile": "Left-Tactile View",
+    "observation.images.right_tactile": "Right-Tactile View",
+}
+
+DESCRIPTION_TO_NATIVE_VIEW_HEADING = {
+    "base ego rgb camera": "Base View",
+    "base or front rgb camera view": "Base View",
+    "ego view": "Base View",
+    "base view": "Base View",
+    "left wrist rgb camera": "Left-Wrist View",
+    "left wrist rgb camera view": "Left-Wrist View",
+    "left-wrist view": "Left-Wrist View",
+    "right wrist rgb camera": "Right-Wrist View",
+    "right wrist rgb camera view": "Right-Wrist View",
+    "right-wrist view": "Right-Wrist View",
+    "left fingertip tactile heatmap": "Left-Tactile View",
+    "left wrist tactile heatmap showing contact force distribution": "Left-Tactile View",
+    "left-tactile view": "Left-Tactile View",
+    "right fingertip tactile heatmap": "Right-Tactile View",
+    "right wrist tactile heatmap showing contact force distribution": "Right-Tactile View",
+    "right-tactile view": "Right-Tactile View",
+}
+
 
 def _remap_official_checkpoint_key(key: str) -> str:
     """Map Xiaomi's converted checkpoint keys to the native LeRobot XR0 module."""
@@ -193,6 +220,20 @@ class XR0Policy(PreTrainedPolicy):
             DEFAULT_IMAGE_DESCRIPTIONS.get(image_key, image_key),
         )
 
+    def _get_image_view_heading(self, image_key: str) -> str:
+        custom_description = self.config.image_key_descriptions.get(image_key)
+        if custom_description:
+            normalized = custom_description.strip().rstrip(".")
+            return DESCRIPTION_TO_NATIVE_VIEW_HEADING.get(normalized.lower(), normalized)
+        return DEFAULT_IMAGE_VIEW_HEADINGS.get(image_key, self._get_image_description(image_key).rstrip("."))
+
+    @staticmethod
+    def _format_task_for_native_prompt(task: str) -> str:
+        task = task.strip()
+        if task.endswith("/no_cot"):
+            return task
+        return f"{task} /no_cot"
+
     def _tensor_to_image(self, image: Tensor) -> np.ndarray:
         image = image.detach().cpu()
         if image.ndim == 4 and image.shape[0] == 1:
@@ -254,19 +295,26 @@ class XR0Policy(PreTrainedPolicy):
 
         messages = []
         for batch_index in range(batch_size):
-            content = []
-            for image_index, image_key in enumerate(image_keys, start=1):
+            content = [
+                {
+                    "type": "text",
+                    "text": "The following observations are captured from multiple views.\n",
+                }
+            ]
+            for image_key in image_keys:
                 image = batch[image_key]
                 if isinstance(image, Tensor) and image.ndim == 4:
                     image = image[batch_index]
-                description = self._get_image_description(image_key).rstrip(".")
-                content.append({"type": "text", "text": f"\nImage {image_index}: {description}.\n"})
+                heading = self._get_image_view_heading(image_key)
+                content.append({"type": "text", "text": f"# {heading}\n"})
                 content.append({"type": "image", "image": self._tensor_to_image(image)})
-            content.append({"type": "text", "text": f"Generate robot actions for the task:\n{tasks[batch_index]}"})
+                content.append({"type": "text", "text": "\n"})
+            task = self._format_task_for_native_prompt(tasks[batch_index])
+            content.append({"type": "text", "text": f"Generate robot actions for the task:\n{task}"})
             messages.append(
                 [
                     {"role": "user", "content": content},
-                    {"role": "assistant", "content": [{"type": "text", "text": "<bot></bot>"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "<cot></cot>"}]},
                 ]
             )
 
