@@ -34,29 +34,38 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IMAGE_DESCRIPTIONS = {
     "observation.images.left_wrist": "left wrist RGB camera view",
-    "observation.images.left_ego": "base or front RGB camera view",
+    "observation.images.left_ego": "ego RGB camera view",
     "observation.images.right_wrist": "right wrist RGB camera view",
     "observation.images.left_tactile": (
         "left wrist tactile heatmap showing contact force distribution"
     ),
     "observation.images.right_tactile": (
-        "right wrist tactile heatmap showing contact force distribution"
+        "right gripper tactile heatmap showing contact force distribution"
     ),
 }
 
+DEFAULT_IMAGE_KEY_ORDER = (
+    "observation.images.left_ego",
+    "observation.images.left_wrist",
+    "observation.images.right_wrist",
+    "observation.images.left_tactile",
+    "observation.images.right_tactile",
+)
+
 DEFAULT_IMAGE_VIEW_HEADINGS = {
-    "observation.images.left_ego": "Base View",
+    "observation.images.left_ego": "Ego View",
     "observation.images.left_wrist": "Left-Wrist View",
     "observation.images.right_wrist": "Right-Wrist View",
     "observation.images.left_tactile": "Left-Tactile View",
-    "observation.images.right_tactile": "Right-Tactile View",
+    "observation.images.right_tactile": "Right-Gripper Tactile View",
 }
 
 DESCRIPTION_TO_NATIVE_VIEW_HEADING = {
-    "base ego rgb camera": "Base View",
-    "base or front rgb camera view": "Base View",
-    "ego view": "Base View",
-    "base view": "Base View",
+    "base ego rgb camera": "Ego View",
+    "base or front rgb camera view": "Ego View",
+    "ego rgb camera view": "Ego View",
+    "ego view": "Ego View",
+    "base view": "Ego View",
     "left wrist rgb camera": "Left-Wrist View",
     "left wrist rgb camera view": "Left-Wrist View",
     "left-wrist view": "Left-Wrist View",
@@ -66,9 +75,11 @@ DESCRIPTION_TO_NATIVE_VIEW_HEADING = {
     "left fingertip tactile heatmap": "Left-Tactile View",
     "left wrist tactile heatmap showing contact force distribution": "Left-Tactile View",
     "left-tactile view": "Left-Tactile View",
-    "right fingertip tactile heatmap": "Right-Tactile View",
-    "right wrist tactile heatmap showing contact force distribution": "Right-Tactile View",
-    "right-tactile view": "Right-Tactile View",
+    "right fingertip tactile heatmap": "Right-Gripper Tactile View",
+    "right wrist tactile heatmap showing contact force distribution": "Right-Gripper Tactile View",
+    "right gripper tactile heatmap showing contact force distribution": "Right-Gripper Tactile View",
+    "right-tactile view": "Right-Gripper Tactile View",
+    "right-gripper tactile view": "Right-Gripper Tactile View",
 }
 
 
@@ -212,7 +223,9 @@ class XR0Policy(PreTrainedPolicy):
             if unused_keys:
                 logger.warning("XR0 will ignore image keys not listed in image_key_order: %s", unused_keys)
             return list(self.config.image_key_order)
-        return sorted(available_keys)
+        ordered_keys = [key for key in DEFAULT_IMAGE_KEY_ORDER if key in available_keys]
+        ordered_keys.extend(sorted(available_keys - set(ordered_keys)))
+        return ordered_keys
 
     def _get_image_description(self, image_key: str) -> str:
         return self.config.image_key_descriptions.get(
