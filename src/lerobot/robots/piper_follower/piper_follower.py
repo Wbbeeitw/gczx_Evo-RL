@@ -22,6 +22,7 @@ from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.motors import MotorCalibration
 from lerobot.processor import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.piper_sdk import (
     PIPER_ACTION_KEYS,
     PIPER_JOINT_ACTION_KEYS,
@@ -41,6 +42,26 @@ from .config_piper_follower import PiperFollowerConfig, PiperXFollowerConfig
 logger = logging.getLogger(__name__)
 PIPER_CALIB_KEYS = list(PIPER_ACTION_KEYS)
 PIPER_CALIB_IDS = {key: idx for idx, key in enumerate(PIPER_CALIB_KEYS)}
+
+
+def _camera_has_active_resources(camera: object) -> bool:
+    return bool(
+        getattr(camera, "is_connected", False)
+        or getattr(camera, "_runtime", None) is not None
+        or getattr(camera, "_read_thread", None) is not None
+        or getattr(camera, "thread", None) is not None
+    )
+
+
+def _has_active_resources(device: object) -> bool:
+    if bool(
+        getattr(device, "is_connected", False)
+        or getattr(device, "_is_connected", False)
+        or getattr(device, "_process", None) is not None
+    ):
+        return True
+
+    return any(_camera_has_active_resources(camera) for camera in getattr(device, "cameras", {}).values())
 
 
 class PiperFollower(Robot):
@@ -103,7 +124,7 @@ class PiperFollower(Robot):
             guard_piper_ctrl_mode_on_connect(arm=self.arm, interface_name=self.config.port)
 
         self._is_connected = True
-        connected_cameras = []
+        attempted_cameras = []
         try:
             self.configure()
             should_auto_calibrate = not self.is_calibrated and calibrate and self.config.require_calibration
@@ -124,12 +145,18 @@ class PiperFollower(Robot):
 
             if not self._teleop_send_only_mode:
                 for cam in self.cameras.values():
+                    attempted_cameras.append(cam)
                     cam.connect()
-                    connected_cameras.append(cam)
-        except Exception:
-            self.arm.DisconnectPort()
-            for cam in connected_cameras:
-                cam.disconnect()
+        except BaseException:
+            try:
+                self.arm.DisconnectPort()
+            except Exception:
+                logger.exception("Failed to disconnect Piper follower after connect error.")
+            for cam in reversed(attempted_cameras):
+                try:
+                    cam.disconnect()
+                except Exception:
+                    logger.exception("Failed to disconnect camera after Piper follower connect error.")
             self._is_connected = False
             raise
 
@@ -308,18 +335,39 @@ class PiperFollower(Robot):
 
         return sent_action
 
-    @check_if_not_connected
     def disconnect(self) -> None:
+        if not _has_active_resources(self):
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        camera_errors = []
         try:
-            if self.config.disable_on_disconnect:
+            if self._is_connected and self.config.disable_on_disconnect:
                 self.arm.DisableArm(7)
         finally:
-            self.arm.DisconnectPort()
-            for cam in self.cameras.values():
-                if cam.is_connected:
-                    cam.disconnect()
-            self._is_connected = False
-            logger.info("%s disconnected.", self)
+            try:
+                if self._is_connected:
+                    self.arm.DisconnectPort()
+            finally:
+                if not self._teleop_send_only_mode:
+                    for cam in self.cameras.values():
+                        for attempt in range(2):
+                            try:
+                                cam.disconnect()
+                            except DeviceNotConnectedError:
+                                break
+                            except Exception as error:
+                                if attempt == 0 and _camera_has_active_resources(cam):
+                                    logger.warning(
+                                        "Failed to disconnect Piper follower camera; retrying once.",
+                                        exc_info=True,
+                                    )
+                                    continue
+                                logger.exception("Failed to disconnect Piper follower camera.")
+                                camera_errors.append(error)
+                            break
+                self._is_connected = False
+                logger.info("%s disconnected.", self)
+        if camera_errors:
+            raise RuntimeError("One or more Piper follower cameras failed to disconnect.") from camera_errors[0]
 
 
 class PiperXFollower(PiperFollower):

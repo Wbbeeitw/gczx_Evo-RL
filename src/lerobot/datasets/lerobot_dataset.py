@@ -1546,7 +1546,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Reset the buffer
         self.episode_buffer = self.create_episode_buffer()
 
-    def start_image_writer(self, num_processes: int = 0, num_threads: int = 4) -> None:
+    def start_image_writer(
+        self,
+        num_processes: int = 0,
+        num_threads: int = 4,
+        max_queue_size: int = 0,
+    ) -> None:
         if isinstance(self.image_writer, AsyncImageWriter):
             logging.warning(
                 "You are starting a new AsyncImageWriter that is replacing an already existing one in the dataset."
@@ -1555,6 +1560,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.image_writer = AsyncImageWriter(
             num_processes=num_processes,
             num_threads=num_threads,
+            max_queue_size=max_queue_size,
         )
 
     def stop_image_writer(self) -> None:
@@ -1594,6 +1600,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
+        image_writer_queue_size: int = 0,
     ) -> "LeRobotDataset":
         """Create a LeRobot Dataset from scratch in order to record data."""
         if vcodec not in VALID_VIDEO_CODECS:
@@ -1617,7 +1624,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.vcodec = vcodec
 
         if image_writer_processes or image_writer_threads:
-            obj.start_image_writer(image_writer_processes, image_writer_threads)
+            obj.start_image_writer(
+                image_writer_processes,
+                image_writer_threads,
+                image_writer_queue_size,
+            )
 
         # TODO(aliberts, rcadene, alexander-soare): Merge this with OnlineBuffer/DataBuffer
         obj.episode_buffer = obj.create_episode_buffer()

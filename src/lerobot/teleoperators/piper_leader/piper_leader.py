@@ -121,7 +121,7 @@ class PiperLeader(Teleoperator):
                     self.id,
                 )
                 self.calibrate()
-        except Exception:
+        except BaseException:
             self._stop_gravity_comp_loop_if_needed()
             self.arm.DisconnectPort()
             self._is_connected = False

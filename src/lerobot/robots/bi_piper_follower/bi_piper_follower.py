@@ -24,7 +24,9 @@ from lerobot.robots.piper_follower import (
     PiperXFollower,
     PiperXFollowerConfig,
 )
+from lerobot.robots.piper_follower.piper_follower import _has_active_resources
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..robot import Robot
 from .config_bi_piper_follower import BiPiperFollowerConfig, BiPiperXFollowerConfig
@@ -116,7 +118,16 @@ class BiPiperFollower(Robot):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        try:
+            self.right_arm.connect(calibrate)
+        except BaseException:
+            for arm in (self.right_arm, self.left_arm):
+                try:
+                    if _has_active_resources(arm):
+                        arm.disconnect()
+                except Exception:
+                    logger.exception("Failed to disconnect Piper follower after right-arm connect failure.")
+            raise
 
     def set_teleop_send_only_mode(self, enabled: bool) -> None:
         self.left_arm.set_teleop_send_only_mode(enabled)
@@ -164,10 +175,23 @@ class BiPiperFollower(Robot):
         prefixed_sent_action_right = {f"right_{key}": value for key, value in sent_action_right.items()}
         return {**prefixed_sent_action_left, **prefixed_sent_action_right}
 
-    @check_if_not_connected
     def disconnect(self):
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        disconnected = False
+        first_error = None
+        for arm in (self.left_arm, self.right_arm):
+            if not _has_active_resources(arm):
+                continue
+            disconnected = True
+            try:
+                arm.disconnect()
+            except Exception as error:
+                logger.exception("Failed to disconnect one Piper follower arm.")
+                if first_error is None:
+                    first_error = error
+        if not disconnected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        if first_error is not None:
+            raise RuntimeError("One or more Piper follower arms failed to disconnect.") from first_error
 
 
 class BiPiperXFollower(BiPiperFollower):

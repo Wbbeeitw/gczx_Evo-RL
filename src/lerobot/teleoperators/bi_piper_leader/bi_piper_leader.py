@@ -29,6 +29,7 @@ from lerobot.teleoperators.piper_leader import (
 )
 from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..teleoperator import Teleoperator
 from .config_bi_piper_leader import BiPiperLeaderConfig, BiPiperXLeaderConfig
@@ -127,7 +128,7 @@ class _PiperLeaderProcessProxy:
         try:
             self._call("connect", calibrate)
             self._is_connected = True
-        except Exception:
+        except BaseException:
             self.disconnect()
             raise
 
@@ -260,7 +261,20 @@ class BiPiperLeader(Teleoperator):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        try:
+            self.right_arm.connect(calibrate)
+        except BaseException:
+            for arm in (self.right_arm, self.left_arm):
+                try:
+                    if (
+                        arm.is_connected
+                        or getattr(arm, "_is_connected", False)
+                        or getattr(arm, "_process", None) is not None
+                    ):
+                        arm.disconnect()
+                except Exception:
+                    logger.exception("Failed to disconnect Piper leader after right-arm connect failure.")
+            raise
 
     @property
     def is_calibrated(self) -> bool:
@@ -304,10 +318,28 @@ class BiPiperLeader(Teleoperator):
         self.left_arm.send_feedback(left_feedback)
         self.right_arm.send_feedback(right_feedback)
 
-    @check_if_not_connected
     def disconnect(self) -> None:
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        disconnected = False
+        first_error = None
+        for arm in (self.left_arm, self.right_arm):
+            needs_disconnect = bool(
+                arm.is_connected
+                or getattr(arm, "_is_connected", False)
+                or getattr(arm, "_process", None) is not None
+            )
+            if not needs_disconnect:
+                continue
+            disconnected = True
+            try:
+                arm.disconnect()
+            except Exception as error:
+                logger.exception("Failed to disconnect one Piper leader arm.")
+                if first_error is None:
+                    first_error = error
+        if not disconnected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        if first_error is not None:
+            raise RuntimeError("One or more Piper leader arms failed to disconnect.") from first_error
 
 
 class BiPiperXLeader(BiPiperLeader):

@@ -347,6 +347,98 @@ def test_piper_follower_connect_rolls_back_connected_cameras(monkeypatch):
     assert not robot.is_connected
 
 
+def test_piper_follower_connect_rolls_back_on_keyboard_interrupt(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    class InterruptingCamera:
+        is_connected = False
+
+        def connect(self):
+            raise KeyboardInterrupt
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(
+        piper_follower_module,
+        "make_cameras_from_configs",
+        lambda _: {"camera": InterruptingCamera()},
+    )
+    robot = PiperFollower(PiperFollowerConfig(port="can0"))
+    robot.calibration = make_identity_calibration()
+
+    with pytest.raises(KeyboardInterrupt):
+        robot.connect(calibrate=False)
+
+    assert not robot.arm.connected
+    assert not robot._is_connected
+
+
+def test_piper_follower_disconnects_arm_after_camera_drops(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    class DroppedCamera:
+        is_connected = True
+
+        def connect(self):
+            self.is_connected = True
+
+        def disconnect(self):
+            self.is_connected = False
+
+    camera = DroppedCamera()
+    monkeypatch.setattr(
+        piper_follower_module,
+        "make_cameras_from_configs",
+        lambda _: {"camera": camera},
+    )
+    robot = PiperFollower(PiperFollowerConfig(port="can0"))
+    robot.calibration = make_identity_calibration()
+    robot.connect(calibrate=False)
+    camera.is_connected = False
+
+    assert not robot.is_connected
+    robot.disconnect()
+    assert not robot.arm.connected
+    assert not robot._is_connected
+
+
+def test_piper_follower_disconnect_retries_partial_tactile_runtime(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    class FlakyRuntime:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                raise RuntimeError("stop failed")
+
+    class PartialTactileCamera:
+        is_connected = False
+
+        def __init__(self):
+            self._runtime = FlakyRuntime()
+
+        def disconnect(self):
+            self._runtime.stop()
+            self._runtime = None
+
+    camera = PartialTactileCamera()
+    monkeypatch.setattr(
+        piper_follower_module,
+        "make_cameras_from_configs",
+        lambda _: {"tactile": camera},
+    )
+    robot = PiperFollower(PiperFollowerConfig(port="can0"))
+    runtime = camera._runtime
+
+    robot.disconnect()
+    assert runtime.stop_calls == 2
+    assert camera._runtime is None
+
+
 def test_piper_require_calibration_false_allows_uncalibrated_control(monkeypatch):
     patch_fake_sdk(monkeypatch)
 
@@ -739,6 +831,134 @@ def test_bimanual_piper_follower_action_features_are_available_without_connect(m
     assert action_features["left_gripper.pos"] is float
     assert action_features["right_joint_1.pos"] is float
     assert action_features["right_gripper.pos"] is float
+
+
+@pytest.mark.parametrize("device_cls", [BiPiperFollower, BiPiperLeader])
+def test_bimanual_piper_connect_rolls_back_left_arm_when_right_arm_fails(device_cls):
+    class FakeArm:
+        def __init__(self, fail: bool = False):
+            self.fail = fail
+            self.is_connected = False
+            self.disconnect_calls = 0
+
+        def connect(self, calibrate: bool = True):
+            del calibrate
+            if self.fail:
+                self.is_connected = True
+                raise RuntimeError("right arm failed")
+            self.is_connected = True
+
+        def disconnect(self):
+            self.disconnect_calls += 1
+            self.is_connected = False
+
+    device = device_cls.__new__(device_cls)
+    device.left_arm = FakeArm()
+    device.right_arm = FakeArm(fail=True)
+
+    with pytest.raises(RuntimeError, match="right arm failed"):
+        device.connect(calibrate=False)
+
+    assert not device.left_arm.is_connected
+    assert device.left_arm.disconnect_calls == 1
+    assert not device.right_arm.is_connected
+    assert device.right_arm.disconnect_calls == 1
+
+
+def test_bimanual_piper_follower_connect_cleans_partial_right_arm_resources():
+    class FakeCamera:
+        is_connected = False
+        _runtime = object()
+
+    class FakeArm:
+        def __init__(self, fail: bool = False):
+            self.fail = fail
+            self.is_connected = False
+            self.cameras = {"tactile": FakeCamera()} if fail else {}
+            self.disconnect_calls = 0
+
+        def connect(self, calibrate: bool = True):
+            del calibrate
+            if self.fail:
+                raise RuntimeError("right arm failed")
+            self.is_connected = True
+
+        def disconnect(self):
+            self.disconnect_calls += 1
+            self.is_connected = False
+            for camera in self.cameras.values():
+                camera._runtime = None
+
+    device = BiPiperFollower.__new__(BiPiperFollower)
+    device.left_arm = FakeArm()
+    device.right_arm = FakeArm(fail=True)
+
+    with pytest.raises(RuntimeError, match="right arm failed"):
+        device.connect(calibrate=False)
+
+    assert device.left_arm.disconnect_calls == 1
+    assert device.right_arm.disconnect_calls == 1
+    assert device.right_arm.cameras["tactile"]._runtime is None
+
+
+@pytest.mark.parametrize("device_cls", [BiPiperFollower, BiPiperLeader])
+def test_bimanual_piper_disconnect_continues_after_one_arm_fails(device_cls):
+    class FakeArm:
+        def __init__(self, fail: bool = False):
+            self.fail = fail
+            self.is_connected = True
+            self.disconnect_calls = 0
+
+        def disconnect(self):
+            self.disconnect_calls += 1
+            self.is_connected = False
+            if self.fail:
+                raise RuntimeError("disconnect failed")
+
+    device = device_cls.__new__(device_cls)
+    device.left_arm = FakeArm(fail=True)
+    device.right_arm = FakeArm()
+
+    with pytest.raises(RuntimeError, match="failed to disconnect"):
+        device.disconnect()
+
+    assert device.left_arm.disconnect_calls == 1
+    assert device.right_arm.disconnect_calls == 1
+    assert not device.right_arm.is_connected
+
+
+def test_bimanual_piper_follower_disconnect_retries_partial_arm_resources():
+    class FakeCamera:
+        is_connected = False
+
+        def __init__(self):
+            self._runtime = object()
+
+    class FakeArm:
+        is_connected = False
+
+        def __init__(self, *, fail_once: bool = False):
+            self.camera = FakeCamera() if fail_once else None
+            self.cameras = {"tactile": self.camera} if self.camera is not None else {}
+            self.disconnect_calls = 0
+
+        def disconnect(self):
+            self.disconnect_calls += 1
+            if self.disconnect_calls == 1:
+                raise RuntimeError("stop failed")
+            self.camera._runtime = None
+
+    device = BiPiperFollower.__new__(BiPiperFollower)
+    device.left_arm = FakeArm(fail_once=True)
+    device.right_arm = FakeArm()
+
+    with pytest.raises(RuntimeError, match="failed to disconnect"):
+        device.disconnect()
+    assert device.left_arm.camera._runtime is not None
+
+    device.disconnect()
+    assert device.left_arm.disconnect_calls == 2
+    assert device.left_arm.camera._runtime is None
 
 
 def test_bimanual_piper_teleop_loop_smoke(monkeypatch):

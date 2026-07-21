@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .protocol import TactileSerialProtocol
-from .types import SENSOR_NAMES, SensorSnapshot, TactileFrame
+from .types import SensorSnapshot, TactileFrame
 
 
 class TactileSensorDriver(TactileSerialProtocol):
@@ -108,6 +108,11 @@ class TactileSensorDriver(TactileSerialProtocol):
             except Exception:
                 pass
         super().close()
+
+    def force_close(self) -> None:
+        """Close the serial port without sending graceful shutdown commands."""
+        self.auto_push_mode = False
+        super().force_close()
 
     def read_sensor_configuration(self) -> bool:
         """Read the sensor configuration register and populate

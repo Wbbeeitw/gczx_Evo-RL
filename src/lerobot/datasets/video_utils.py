@@ -632,6 +632,12 @@ class VideoEncodingManager:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            try:
+                self.dataset._wait_image_writer()
+            except Exception:
+                logging.exception("Image writer failed while cleaning up an interrupted episode.")
+
         # Handle any remaining episodes that haven't been batch encoded
         if self.dataset.episodes_since_last_encoding > 0:
             if exc_type is not None:

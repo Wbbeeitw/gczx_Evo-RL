@@ -142,10 +142,9 @@ def test_write_image_image(tmp_path, img_factory):
 def test_write_image_exception(tmp_path):
     image_array = "invalid data"
     fpath = tmp_path / DUMMY_IMAGE
-    with patch("builtins.print") as mock_print:
+    with pytest.raises(TypeError, match="Unsupported image type"):
         write_image(image_array, fpath)
-        mock_print.assert_called()
-        assert not fpath.exists()
+    assert not fpath.exists()
 
 
 def test_save_image_numpy(tmp_path, img_array_factory):
@@ -243,11 +242,30 @@ def test_save_image_invalid_data(tmp_path):
         image_array = "invalid data"
         fpath = tmp_path / DUMMY_IMAGE
         fpath.parent.mkdir(parents=True, exist_ok=True)
-        with patch("builtins.print") as mock_print:
-            writer.save_image(image_array, fpath)
+        writer.save_image(image_array, fpath)
+        with pytest.raises(RuntimeError, match="Asynchronous image writing failed"):
             writer.wait_until_done()
-            mock_print.assert_called()
-            assert not fpath.exists()
+        assert not fpath.exists()
+    finally:
+        writer.stop()
+
+
+def test_save_image_invalid_data_multiprocessing(tmp_path):
+    writer = AsyncImageWriter(num_processes=1, num_threads=1)
+    try:
+        fpath = tmp_path / DUMMY_IMAGE
+        writer.save_image("invalid data", fpath)
+        with pytest.raises(RuntimeError, match="Asynchronous image writing failed"):
+            writer.wait_until_done()
+        assert not fpath.exists()
+    finally:
+        writer.stop()
+
+
+def test_bounded_queue_size():
+    writer = AsyncImageWriter(max_queue_size=3)
+    try:
+        assert writer.queue.maxsize == 3
     finally:
         writer.stop()
 
@@ -257,8 +275,8 @@ def test_save_image_after_stop(tmp_path, img_array_factory):
     writer.stop()
     image_array = img_array_factory()
     fpath = tmp_path / DUMMY_IMAGE
-    writer.save_image(image_array, fpath)
-    time.sleep(1)
+    with pytest.raises(RuntimeError, match="writer has stopped"):
+        writer.save_image(image_array, fpath)
     assert not fpath.exists()
 
 
@@ -330,10 +348,10 @@ def test_exception_handling(tmp_path, img_array_factory):
         image_array = img_array_factory()
         with (
             patch.object(writer.queue, "put", side_effect=queue.Full("Queue is full")),
-            pytest.raises(queue.Full) as exc_info,
+            pytest.raises(RuntimeError, match="queue stayed full") as exc_info,
         ):
             writer.save_image(image_array, tmp_path / "test.png")
-        assert str(exc_info.value) == "Queue is full"
+        assert isinstance(exc_info.value.__cause__, queue.Full)
     finally:
         writer.stop()
 

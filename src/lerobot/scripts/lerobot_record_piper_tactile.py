@@ -29,7 +29,6 @@ Usage::
         --left-tactile-port /dev/ttyACM0 \\
         --right-tactile-port /dev/ttyACM1 \\
         --dataset.repo_id my_org/my_dataset \\
-        --dataset.num_episodes 50 \\
         --fps 30
 """
 
@@ -41,45 +40,167 @@ import os
 import select
 import sys
 import termios
+import threading
 import time
 import tty
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from pathlib import Path
-from pprint import pformat
+from queue import Full, Queue
 
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
-from lerobot.cameras.tactile.configuration_tactile import TactileCameraConfig  # noqa: F401
-from lerobot.configs import parser
+import numpy as np
+
+from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+from lerobot.cameras.tactile.configuration_tactile import TactileCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.utils import combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.processor import make_default_processors
-from lerobot.robots import (
-    make_robot_from_config,
-)
-from lerobot.robots.bi_piper_follower import (
-    BiPiperFollower,
-    BiPiperFollowerConfig,
-    BiPiperXFollower,
-    BiPiperXFollowerConfig,
-)
+from lerobot.robots import make_robot_from_config
+from lerobot.robots.bi_piper_follower import BiPiperFollowerConfig, BiPiperXFollowerConfig
 from lerobot.robots.piper_follower import PiperFollowerConfigBase
+from lerobot.robots.piper_follower.piper_follower import _has_active_resources
 from lerobot.teleoperators import make_teleoperator_from_config
-from lerobot.teleoperators.bi_piper_leader import BiPiperLeaderConfig
-from lerobot.teleoperators.bi_piper_leader import BiPiperXLeaderConfig
+from lerobot.teleoperators.bi_piper_leader import BiPiperLeaderConfig, BiPiperXLeaderConfig
 from lerobot.teleoperators.piper_leader import PiperLeaderConfigBase
-from lerobot.utils.control_utils import (
-    sanity_check_bimanual_piper_pair,
-    sanity_check_dataset_name,
-)
-import threading
-import numpy as np
-from queue import Queue
-
+from lerobot.utils.control_utils import sanity_check_bimanual_piper_pair, sanity_check_dataset_name
 from lerobot.utils.utils import init_logging
+
+_FRAME_QUEUE_SENTINEL = object()
+_SAVED_OUTCOMES = frozenset({"success", "failure", "ongoing"})
+
+
+class _FrameWriter:
+    """Write dataset frames in order and surface worker failures to the caller."""
+
+    def __init__(self, dataset: LeRobotDataset, max_queue_size: int = 0) -> None:
+        self._dataset = dataset
+        self._queue: Queue[object] = Queue(maxsize=max_queue_size)
+        self._lock = threading.Lock()
+        self._closed = False
+        self._abort_event = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="frame-writer", daemon=False)
+        self._thread.start()
+
+    def submit(self, frame: dict[str, object]) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Frame writer is already closed.")
+            error = self._error
+            if error is None:
+                try:
+                    self._queue.put(frame, timeout=1.0)
+                except Full as queue_error:
+                    raise RuntimeError("Frame writer queue stayed full for 1 second.") from queue_error
+        if error is not None:
+            raise RuntimeError("Frame writer failed while adding a frame.") from error
+        self._raise_if_failed()
+
+    def close(self) -> None:
+        with self._lock:
+            should_signal = not self._closed
+            self._closed = True
+        if should_signal:
+            while self._thread.is_alive():
+                try:
+                    self._queue.put(_FRAME_QUEUE_SENTINEL, timeout=0.1)
+                    break
+                except Full:
+                    continue
+        self._thread.join()
+        self._raise_if_failed()
+
+    def abort(self) -> None:
+        """Stop after the current write without draining queued frames."""
+        with self._lock:
+            should_signal = not self._closed
+            self._closed = True
+            self._abort_event.set()
+        if should_signal:
+            try:
+                self._queue.put_nowait(_FRAME_QUEUE_SENTINEL)
+            except Full:
+                pass
+        self._thread.join()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                if item is _FRAME_QUEUE_SENTINEL or self._abort_event.is_set():
+                    return
+                self._dataset.add_frame(item)
+        except BaseException as error:
+            with self._lock:
+                self._error = error
+
+    def _raise_if_failed(self) -> None:
+        with self._lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError("Frame writer failed while adding a frame.") from error
+
+
+def _episode_metadata(outcome: str) -> dict[str, str]:
+    if outcome not in _SAVED_OUTCOMES:
+        raise ValueError(f"Cannot save unsupported episode outcome: {outcome!r}.")
+    return {"trajectory_type": outcome}
+
+
+def _missing_left_wrist_frame(
+    observation: dict[str, object],
+    *,
+    fill_mode: str,
+    ego_camera_side: str,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    if fill_mode == "black":
+        return np.zeros((height, width, 3), dtype=np.uint8)
+
+    source_key = f"{ego_camera_side}_ego" if fill_mode == "copy-ego" else "right_wrist"
+    source = observation.get(source_key)
+    if not isinstance(source, np.ndarray):
+        raise RuntimeError(f"Cannot fill left_wrist from missing image {source_key!r}.")
+    return source.copy()
+
+
+def _disconnect_hardware(robot, teleop, logger: logging.Logger) -> None:
+    for device_name, device in (("robot", robot), ("teleoperator", teleop)):
+        arms = [getattr(device, side, None) for side in ("left_arm", "right_arm")]
+        arms = [arm for arm in arms if arm is not None]
+        targets = arms or [device]
+        for target in targets:
+            if not _has_active_resources(target):
+                continue
+            for attempt in range(2):
+                try:
+                    target.disconnect()
+                except Exception:
+                    if attempt == 0 and _has_active_resources(target):
+                        logger.warning(
+                            "Failed to disconnect %s cleanly; retrying once.",
+                            device_name,
+                            exc_info=True,
+                        )
+                        continue
+                    logger.exception("Failed to disconnect %s cleanly.", device_name)
+                    break
+                if not _has_active_resources(target):
+                    break
+                if attempt == 0:
+                    logger.warning("%s still has active resources; retrying once.", device_name)
+                    continue
+                logger.error("%s still has active resources after disconnect retry.", device_name)
+
+
+@contextmanager
+def _disconnect_on_error(robot, teleop, logger: logging.Logger):
+    try:
+        yield
+    except BaseException:
+        _disconnect_hardware(robot, teleop, logger)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +273,7 @@ def parse_args() -> argparse.Namespace:
     # Cameras
     parser.add_argument("--top-camera", type=str, required=True, help="RealSense serial for ego camera.")
     parser.add_argument("--left-wrist-camera", type=str, default=None,
-                        help="RealSense serial for left wrist (optional).")
+                        help="RealSense serial for left wrist. If omitted, --missing-left-wrist-fill is used.")
     parser.add_argument("--right-wrist-camera", type=str, required=True)
     parser.add_argument("--ego-camera-side", choices=("left", "right"), default="left")
     parser.add_argument("--missing-left-wrist-fill", choices=("black", "copy-ego", "copy-right-wrist"),
@@ -172,15 +293,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tactile-gamma", type=float, default=0.75)
     parser.add_argument("--tactile-rgb-vmax-fz", type=float, default=25.5)
     parser.add_argument("--tactile-rgb-vmax-shear", type=float, default=12.8)
-    parser.add_argument("--tactile-calibrate-on-connect", action="store_true", default=True)
+    parser.add_argument(
+        "--tactile-calibrate-on-connect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     # Piper params
     parser.add_argument("--follower-startup-sleep-s", type=float, default=0.5)
     parser.add_argument("--leader-startup-sleep-s", type=float, default=0.1)
     parser.add_argument("--follower-speed-ratio", type=int, default=100)
-    parser.add_argument("--follower-high-follow", action="store_true", default=True)
+    parser.add_argument("--follower-high-follow", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--leader-command-speed-ratio", type=int, default=100)
-    parser.add_argument("--leader-command-high-follow", action="store_true", default=True)
-    parser.add_argument("--leader-process-isolation", action="store_true", default=True)
+    parser.add_argument("--leader-command-high-follow", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--leader-process-isolation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-calibration", action="store_true", default=False)
     # Recording
     parser.add_argument("--fps", type=int, default=30)
@@ -201,7 +326,7 @@ def parse_args() -> argparse.Namespace:
         default="serial",
         help=(
             "How aggressively to save image/video data. "
-            "'serial' uses one image writer thread and encodes camera videos one by one for stability; "
+            "'serial' uses one image writer thread per camera and encodes videos one by one for stability; "
             "'parallel' restores the faster multi-thread/multi-process behavior."
         ),
     )
@@ -210,9 +335,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override image writer thread count. Defaults to 1 in serial mode, "
+            "Override image writer thread count. Defaults to one per camera in serial mode, "
             "or 4 threads per camera in parallel mode."
         ),
+    )
+    parser.add_argument(
+        "--image-writer-queue-size",
+        type=int,
+        default=None,
+        help="Maximum queued PNG writes. Defaults to one second of frames across all cameras.",
+    )
+    parser.add_argument(
+        "--frame-writer-queue-size",
+        type=int,
+        default=None,
+        help="Maximum queued dataset frames. Defaults to one second at --fps.",
     )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
@@ -338,31 +475,20 @@ def main():
     )
     sanity_check_bimanual_piper_pair(robot_cfg, teleop_cfg)
 
-    # ---- Connect -------------------------------------------------------------
     robot = make_robot_from_config(robot_cfg)
     teleop = make_teleoperator_from_config(teleop_cfg)
-
-    robot.connect()
-    try:
-        teleop.connect()
-    except Exception:
-        robot.disconnect()
-        raise
-
-    logger.info(
-        "Connected robot=%s follower=(%s,%s) leader=(%s,%s) "
-        "top=%s l_wrist=%s r_wrist=%s l_tactile=%s r_tactile=%s",
-        args.robot_id, args.left_follower_can, args.right_follower_can,
-        args.left_leader_can, args.right_leader_can,
-        args.top_camera, args.left_wrist_camera or "masked", args.right_wrist_camera,
-        args.left_tactile_port or "off", args.right_tactile_port or "off",
-    )
 
     # ---- Create LeRobot dataset ----------------------------------------------
     sanity_check_dataset_name(args.dataset_repo_id, None)
 
     # Build feature schema from robot (same as lerobot-record)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    observation_features = dict(robot.observation_features)
+    camera_keys = list(robot._cameras_ft)
+    if args.left_wrist_camera is None:
+        observation_features["left_wrist"] = (args.height, args.width, 3)
+        camera_keys.append("left_wrist")
+
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
             pipeline=teleop_action_processor,
@@ -371,18 +497,26 @@ def main():
         ),
         aggregate_pipeline_dataset_features(
             pipeline=robot_observation_processor,
-            initial_features=create_initial_features(observation=robot.observation_features),
+            initial_features=create_initial_features(observation=observation_features),
             use_videos=True,
         ),
     )
 
-    num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 1
+    num_cameras = max(len(camera_keys), 1)
     if args.image_writer_threads is None:
-        image_writer_threads = 1 if args.save_mode == "serial" else 4 * num_cameras
+        image_writer_threads = num_cameras if args.save_mode == "serial" else 4 * num_cameras
     else:
         image_writer_threads = args.image_writer_threads
     if image_writer_threads < 1:
         raise ValueError("--image-writer-threads must be >= 1.")
+    image_writer_queue_size = (
+        args.fps * num_cameras if args.image_writer_queue_size is None else args.image_writer_queue_size
+    )
+    frame_writer_queue_size = args.fps if args.frame_writer_queue_size is None else args.frame_writer_queue_size
+    if image_writer_queue_size < 1:
+        raise ValueError("--image-writer-queue-size must be >= 1.")
+    if frame_writer_queue_size < 1:
+        raise ValueError("--frame-writer-queue-size must be >= 1.")
 
     parallel_video_encoding = args.save_mode == "parallel"
     logger.info(
@@ -401,6 +535,7 @@ def main():
         use_videos=True,
         image_writer_processes=0,
         image_writer_threads=image_writer_threads,
+        image_writer_queue_size=image_writer_queue_size,
         batch_encoding_size=1,
         vcodec=args.vcodec,
     )
@@ -409,7 +544,29 @@ def main():
     saved_count = 0
     episode_index = 1
     try:
-        with VideoEncodingManager(dataset):
+        robot.connect()
+        try:
+            teleop.connect()
+        except Exception:
+            robot.disconnect()
+            raise
+
+        logger.info(
+            "Connected robot=%s follower=(%s,%s) leader=(%s,%s) "
+            "top=%s l_wrist=%s r_wrist=%s l_tactile=%s r_tactile=%s",
+            args.robot_id,
+            args.left_follower_can,
+            args.right_follower_can,
+            args.left_leader_can,
+            args.right_leader_can,
+            args.top_camera,
+            args.left_wrist_camera or f"filled:{args.missing_left_wrist_fill}",
+            args.right_wrist_camera,
+            args.left_tactile_port or "off",
+            args.right_tactile_port or "off",
+        )
+
+        with VideoEncodingManager(dataset), _disconnect_on_error(robot, teleop, logger):
             while True:
                 input(f"\nPress ENTER to start episode {episode_index:03d} ...")
 
@@ -427,19 +584,7 @@ def main():
                 )
                 # Offload dataset writes to background thread for smooth teleop
                 state_keys = list(robot._motors_ft.keys())
-                cam_keys = list(robot._cameras_ft.keys())
-                frame_queue: Queue = Queue()
-                write_done = threading.Event()
-
-                def _writer():
-                    while not write_done.is_set():
-                        item = frame_queue.get()
-                        if item is None:
-                            break
-                        dataset.add_frame(item)
-
-                writer_thread = threading.Thread(target=_writer, name="frame-writer", daemon=True)
-                writer_thread.start()
+                frame_writer = _FrameWriter(dataset, max_queue_size=frame_writer_queue_size)
 
                 try:
                     with cbreak_stdin(interactive):
@@ -458,9 +603,19 @@ def main():
                                 "action": action_vals,
                                 "task": args.task,
                             }
-                            for ck in cam_keys:
-                                frame_data[f"observation.images.{ck}"] = obs[ck]
-                            frame_queue.put(frame_data)
+                            for camera_key in camera_keys:
+                                if camera_key == "left_wrist" and camera_key not in obs:
+                                    image = _missing_left_wrist_frame(
+                                        obs,
+                                        fill_mode=args.missing_left_wrist_fill,
+                                        ego_camera_side=args.ego_camera_side,
+                                        height=args.height,
+                                        width=args.width,
+                                    )
+                                else:
+                                    image = obs[camera_key]
+                                frame_data[f"observation.images.{camera_key}"] = image
+                            frame_writer.submit(frame_data)
                             frame_count += 1
 
                             elapsed = time.perf_counter() - start_t
@@ -498,10 +653,12 @@ def main():
                                 # Resync if we're falling behind
                                 start_t = time.perf_counter() - frame_count * frame_period
 
-                finally:
-                    write_done.set()
-                    frame_queue.put(None)
-                    writer_thread.join(timeout=5.0)
+                except BaseException:
+                    _disconnect_hardware(robot, teleop, logger)
+                    frame_writer.abort()
+                    raise
+                else:
+                    frame_writer.close()
 
                 print()  # newline after \r
 
@@ -540,11 +697,9 @@ def main():
                         break
 
                 # Save
-                ep_success = True if outcome == "success" else False
-                extra_meta = {"episode_success": ep_success} if outcome in ("success", "failure") else {}
                 dataset.save_episode(
                     parallel_encoding=parallel_video_encoding,
-                    extra_episode_metadata=extra_meta if extra_meta else None,
+                    extra_episode_metadata=_episode_metadata(outcome),
                 )
                 saved_count += 1
                 logger.info(
@@ -559,10 +714,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     finally:
-        if teleop is not None and teleop.is_connected:
-            teleop.disconnect()
-        if robot is not None and robot.is_connected:
-            robot.disconnect()
+        _disconnect_hardware(robot, teleop, logger)
 
         dataset.finalize()
         logger.info(
@@ -570,6 +722,9 @@ def main():
             "To inspect: lerobot-dataset-report --dataset %s",
             saved_count, dataset.root, args.dataset_repo_id,
         )
+
+    if args.push_to_hub:
+        dataset.push_to_hub(private=args.private_ds)
 
 
 if __name__ == "__main__":

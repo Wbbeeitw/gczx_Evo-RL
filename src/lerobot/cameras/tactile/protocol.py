@@ -91,6 +91,19 @@ class TactileSerialProtocol:
             self.ser.close()
         self.ser = None
 
+    def force_close(self) -> None:
+        """Close the serial port without waiting for ``serial_lock``.
+
+        This is reserved for interrupting a serial read that failed to return.
+        """
+        serial_port = self.ser
+        if serial_port is None:
+            return
+        if serial_port.is_open:
+            serial_port.close()
+        if self.ser is serial_port:
+            self.ser = None
+
     # ------------------------------------------------------------------
     # LRC checksum
     # ------------------------------------------------------------------
@@ -189,8 +202,7 @@ class TactileSerialProtocol:
                     time.sleep(0.001)
             return data if data else None
         except Exception as exc:
-            self.logger.warning("Failed to read tactile response: %s", exc)
-            return None
+            raise ConnectionError(f"Failed to read tactile response from {self.port}: {exc}") from exc
 
     def flush_input(self) -> None:
         """Discard any pending input bytes."""

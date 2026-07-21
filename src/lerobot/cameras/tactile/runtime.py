@@ -85,6 +85,7 @@ class TactileRuntime:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._last_error: Exception | None = None
         self._latest_frame: Optional[TactileFrame] = None
         self._frame_event = threading.Event()
         self.offsets: Dict[str, np.ndarray] = {
@@ -109,16 +110,35 @@ class TactileRuntime:
             self.driver.open()
 
         self._running = True
+        self._last_error = None
         self._thread = threading.Thread(target=self._loop, name="tactile-runtime", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         """Stop the background thread and close the driver."""
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+        thread_stuck = thread is not None and thread.is_alive()
+        close_error: Exception | None = None
+        try:
+            if thread_stuck:
+                self.driver.force_close()
+            else:
+                self.driver.close()
+        except Exception as error:
+            close_error = error
+
+        if thread_stuck and thread is not None:
+            thread.join(timeout=2.0)
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("Tactile runtime thread did not stop.") from close_error
+
         self._thread = None
-        self.driver.close()
+        if close_error is not None:
+            raise close_error
 
     # ------------------------------------------------------------------
     # Frame access
@@ -320,14 +340,17 @@ class TactileRuntime:
                 else:
                     frame = None  # distributed poll not used in camera mode
             except Exception as exc:
-                self.logger.warning("Tactile runtime read failed: %s", exc)
-                time.sleep(max(self.poll_interval, 0.1))
-                continue
+                self._last_error = exc
+                self._running = False
+                self.logger.error("Tactile runtime stopped after read failure: %s", exc)
+                break
 
             if frame is not None:
                 with self._lock:
                     self._latest_frame = frame
                     self._frame_event.set()
+            elif self.read_mode == "auto_push":
+                time.sleep(max(min(self.poll_interval, 0.1), 0.01))
 
             if self.read_mode == "distributed_poll":
                 time.sleep(self.poll_interval)

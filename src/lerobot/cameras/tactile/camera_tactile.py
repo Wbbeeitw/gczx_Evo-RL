@@ -77,6 +77,7 @@ class TactileCamera(Camera):
         self._stop_event: Event | None = None
         self._frame_lock: Lock = Lock()
         self._latest_frame: NDArray[Any] | None = None
+        self._latest_timestamp: float | None = None
         self._new_frame_event: Event = Event()
 
     # ------------------------------------------------------------------
@@ -134,19 +135,42 @@ class TactileCamera(Camera):
             rgb_vmax_shear=cfg.rgb_vmax_shear,
         )
 
-        self._runtime.start()
+        try:
+            self._runtime.start()
 
-        if warmup:
-            frame = self._runtime.wait_for_frame(timeout=3.0)
-            if frame is None:
+            if warmup:
+                frame = self._runtime.wait_for_frame(timeout=3.0)
+                if frame is None:
+                    raise ConnectionError(
+                        f"TactileCamera({cfg.port}): no frames received during warmup"
+                    )
+                if cfg.calibrate_on_connect:
+                    self._runtime.calibrate()
+
+            self._start_read_thread()
+        except BaseException:
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if self._read_thread is not None and self._read_thread.is_alive():
+                self._read_thread.join(timeout=2.0)
+            self._read_thread = None
+            self._stop_event = None
+            cleanup_succeeded = True
+            try:
                 self._runtime.stop()
-                raise ConnectionError(
-                    f"TactileCamera({cfg.port}): no frames received during warmup"
-                )
-            if cfg.calibrate_on_connect:
-                self._runtime.calibrate()
+            except Exception:
+                cleanup_succeeded = False
+                logger.exception("TactileCamera(%s) cleanup failed after connect error.", cfg.port)
+            if cleanup_succeeded:
+                self._runtime = None
+                self._driver = None
+                self._visualizer = None
+            with self._frame_lock:
+                self._latest_frame = None
+                self._latest_timestamp = None
+                self._new_frame_event.clear()
+            raise
 
-        self._start_read_thread()
         logger.info("TactileCamera(%s) connected (image=%s)", cfg.port, self._image_shape)
 
     @check_if_not_connected
@@ -155,30 +179,29 @@ class TactileCamera(Camera):
         return self.async_read()
 
     @check_if_not_connected
-    def async_read(self, timeout_ms: float = 5000) -> NDArray[Any]:
-        """Return the latest rendered frame. Non-blocking: returns cached frame immediately."""
+    def async_read(self, timeout_ms: float = 1000) -> NDArray[Any]:
+        """Return a recent rendered frame, waiting for an update when the cache is stale."""
         if self._read_thread is None or not self._read_thread.is_alive():
             raise RuntimeError("TactileCamera read thread is not running.")
 
-        # Return latest frame immediately (non-blocking)
-        with self._frame_lock:
-            frame = self._latest_frame
-        if frame is not None:
-            return frame
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        while True:
+            with self._frame_lock:
+                frame = self._latest_frame
+                timestamp = self._latest_timestamp
+                now = time.perf_counter()
+                if frame is not None and timestamp is not None:
+                    age_ms = (now - timestamp) * 1e3
+                    if age_ms <= timeout_ms:
+                        return frame
+                self._new_frame_event.clear()
 
-        # First call — wait for initial frame
-        if not self._new_frame_event.wait(timeout=timeout_ms / 1000.0):
-            raise TimeoutError(
-                f"TactileCamera({self.config.port}): timed out waiting for initial frame "
-                f"after {timeout_ms} ms."
-            )
-        with self._frame_lock:
-            frame = self._latest_frame
-        if frame is None:
-            raise RuntimeError(
-                f"TactileCamera({self.config.port}): event set but no frame available."
-            )
-        return frame
+            remaining_s = deadline - now
+            if remaining_s <= 0 or not self._new_frame_event.wait(timeout=remaining_s):
+                raise TimeoutError(
+                    f"TactileCamera({self.config.port}): timed out waiting for a fresh frame "
+                    f"after {timeout_ms} ms."
+                )
 
     @check_if_not_connected
     def read_latest(self, max_age_ms: int = 1000) -> NDArray[Any]:
@@ -188,16 +211,24 @@ class TactileCamera(Camera):
 
         with self._frame_lock:
             frame = self._latest_frame
+            timestamp = self._latest_timestamp
 
-        if frame is None:
+        if frame is None or timestamp is None:
             raise RuntimeError(
                 f"TactileCamera({self.config.port}): no frames captured yet."
+            )
+
+        age_ms = (time.perf_counter() - timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"TactileCamera({self.config.port}) latest frame is too old: "
+                f"{age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
             )
         return frame
 
     def disconnect(self) -> None:
         """Stop the runtime and release the serial port."""
-        if not self.is_connected and self._read_thread is None:
+        if self._runtime is None and self._read_thread is None:
             raise DeviceNotConnectedError(
                 f"TactileCamera({self.config.port}) is not connected."
             )
@@ -210,19 +241,28 @@ class TactileCamera(Camera):
         self._read_thread = None
         self._stop_event = None
 
-        # Then stop the runtime.
+        runtime_error = None
         if self._runtime is not None:
-            self._runtime.stop()
-            self._runtime = None
-
-        self._driver = None
-        self._visualizer = None
+            try:
+                self._runtime.stop()
+            except Exception as error:
+                runtime_error = error
+            else:
+                self._runtime = None
+                self._driver = None
+                self._visualizer = None
+        else:
+            self._driver = None
+            self._visualizer = None
 
         with self._frame_lock:
             self._latest_frame = None
+            self._latest_timestamp = None
             self._new_frame_event.clear()
 
         logger.info("TactileCamera(%s) disconnected.", self.config.port)
+        if runtime_error is not None:
+            raise RuntimeError(f"TactileCamera({self.config.port}) failed to stop cleanly.") from runtime_error
 
     # ------------------------------------------------------------------
     # Internal
@@ -263,9 +303,11 @@ class TactileCamera(Camera):
                 # Render calibrated snapshot → BGR image → convert to RGB
                 bgr = self._visualizer.render_snapshot(snapshot, calibrated=True)
                 rgb = bgr[..., ::-1].copy()  # BGR → RGB
+                capture_time = time.perf_counter()
 
                 with self._frame_lock:
                     self._latest_frame = rgb
+                    self._latest_timestamp = capture_time
                 self._new_frame_event.set()
                 last_rendered_ts = snapshot.frame.timestamp
                 failure_count = 0

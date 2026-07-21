@@ -152,8 +152,12 @@ def make_handler(
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        force=True,
+    )
     logger = logging.getLogger("tactile-preview")
+    logger.info("Starting tactile preview on %s", args.port)
 
     driver = TactileSensorDriver(
         port=args.port,
@@ -194,6 +198,8 @@ def main() -> None:
         handler = make_handler(runtime, visualizer, args.refresh_ms, logger)
         server = ThreadingHTTPServer((args.host, args.http_port), handler)
         logger.info("Tactile preview at http://%s:%s", args.host, args.http_port)
+        if args.host == "0.0.0.0":
+            logger.info("Open http://127.0.0.1:%s in the IPC browser.", args.http_port)
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Stopping tactile preview server")

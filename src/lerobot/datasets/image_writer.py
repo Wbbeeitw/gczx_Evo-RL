@@ -73,8 +73,7 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
     Saves a NumPy array or PIL Image to a file.
 
     This function handles both NumPy arrays and PIL Image objects, converting
-    the former to a PIL Image before saving. It includes error handling for
-    the save operation.
+    the former to a PIL Image before saving.
 
     Args:
         image (np.ndarray | PIL.Image.Image): The image data to save.
@@ -88,37 +87,36 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
         TypeError: If the input 'image' is not a NumPy array or a
             PIL.Image.Image object.
 
-    Side Effects:
-        Prints an error message to the console if the image writing process
-        fails for any reason.
     """
-    try:
-        if isinstance(image, np.ndarray):
-            img = image_array_to_pil_image(image)
-        elif isinstance(image, PIL.Image.Image):
-            img = image
-        else:
-            raise TypeError(f"Unsupported image type: {type(image)}")
-        img.save(fpath, compress_level=compress_level)
-    except Exception as e:
-        print(f"Error writing image {fpath}: {e}")
+    if isinstance(image, np.ndarray):
+        img = image_array_to_pil_image(image)
+    elif isinstance(image, PIL.Image.Image):
+        img = image
+    else:
+        raise TypeError(f"Unsupported image type: {type(image)}")
+    img.save(fpath, compress_level=compress_level)
 
 
-def worker_thread_loop(queue: queue.Queue):
+def worker_thread_loop(task_queue: queue.Queue, error_queue, error_event) -> None:
     while True:
-        item = queue.get()
+        item = task_queue.get()
         if item is None:
-            queue.task_done()
+            task_queue.task_done()
             break
         image_array, fpath, compress_level = item
-        write_image(image_array, fpath, compress_level)
-        queue.task_done()
+        try:
+            write_image(image_array, fpath, compress_level)
+        except BaseException as error:
+            error_queue.put((str(fpath), repr(error)))
+            error_event.set()
+        finally:
+            task_queue.task_done()
 
 
-def worker_process(queue: queue.Queue, num_threads: int):
+def worker_process(task_queue: queue.Queue, num_threads: int, error_queue, error_event) -> None:
     threads = []
     for _ in range(num_threads):
-        t = threading.Thread(target=worker_thread_loop, args=(queue,))
+        t = threading.Thread(target=worker_thread_loop, args=(task_queue, error_queue, error_event))
         t.daemon = True
         t.start()
         threads.append(t)
@@ -141,30 +139,42 @@ class AsyncImageWriter:
     the number of threads. If it is still not stable, try to use 1 subprocess, or more.
     """
 
-    def __init__(self, num_processes: int = 0, num_threads: int = 1):
+    def __init__(self, num_processes: int = 0, num_threads: int = 1, max_queue_size: int = 0):
         self.num_processes = num_processes
         self.num_threads = num_threads
+        self.max_queue_size = max_queue_size
         self.queue = None
         self.threads = []
         self.processes = []
         self._stopped = False
+        self._error_message: str | None = None
 
         if num_threads <= 0 and num_processes <= 0:
             raise ValueError("Number of threads and processes must be greater than zero.")
+        if max_queue_size < 0:
+            raise ValueError("Maximum queue size must be greater than or equal to zero.")
 
         if self.num_processes == 0:
-            # Use threading
-            self.queue = queue.Queue()
+            self.queue = queue.Queue(maxsize=max_queue_size)
+            self._error_queue = queue.Queue()
+            self._error_event = threading.Event()
             for _ in range(self.num_threads):
-                t = threading.Thread(target=worker_thread_loop, args=(self.queue,))
+                t = threading.Thread(
+                    target=worker_thread_loop,
+                    args=(self.queue, self._error_queue, self._error_event),
+                )
                 t.daemon = True
                 t.start()
                 self.threads.append(t)
         else:
-            # Use multiprocessing
-            self.queue = multiprocessing.JoinableQueue()
+            self.queue = multiprocessing.JoinableQueue(maxsize=max_queue_size)
+            self._error_queue = multiprocessing.Queue()
+            self._error_event = multiprocessing.Event()
             for _ in range(self.num_processes):
-                p = multiprocessing.Process(target=worker_process, args=(self.queue, self.num_threads))
+                p = multiprocessing.Process(
+                    target=worker_process,
+                    args=(self.queue, self.num_threads, self._error_queue, self._error_event),
+                )
                 p.daemon = True
                 p.start()
                 self.processes.append(p)
@@ -172,13 +182,41 @@ class AsyncImageWriter:
     def save_image(
         self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
     ):
+        if self._stopped:
+            raise RuntimeError("Cannot save an image after the image writer has stopped.")
+        self._raise_if_failed()
         if isinstance(image, torch.Tensor):
             # Convert tensor to numpy array to minimize main process time
             image = image.cpu().numpy()
-        self.queue.put((image, fpath, compress_level))
+        try:
+            self.queue.put((image, fpath, compress_level), timeout=1.0)
+        except queue.Full as error:
+            raise RuntimeError("Image writer queue stayed full for 1 second.") from error
 
     def wait_until_done(self):
         self.queue.join()
+        self._raise_if_failed()
+
+    def _raise_if_failed(self) -> None:
+        if self._error_message is not None:
+            raise RuntimeError(self._error_message)
+        if not self._error_event.is_set():
+            return
+
+        errors = []
+        try:
+            errors.append(self._error_queue.get(timeout=1.0))
+        except queue.Empty:
+            errors.append(("unknown", "image writer failed without error details"))
+        while True:
+            try:
+                errors.append(self._error_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        details = "; ".join(f"{path}: {error}" for path, error in errors)
+        self._error_message = f"Asynchronous image writing failed: {details}"
+        raise RuntimeError(self._error_message)
 
     def stop(self):
         if self._stopped:
@@ -199,5 +237,7 @@ class AsyncImageWriter:
                     p.terminate()
             self.queue.close()
             self.queue.join_thread()
+            self._error_queue.close()
+            self._error_queue.join_thread()
 
         self._stopped = True
