@@ -16,6 +16,8 @@
 
 """Tests for RTC configuration module."""
 
+import pytest
+
 from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
@@ -30,6 +32,8 @@ def test_rtc_config_default_initialization():
     assert config.prefix_attention_schedule == RTCAttentionSchedule.LINEAR
     assert config.max_guidance_weight == 10.0
     assert config.execution_horizon == 10
+    assert config.warmup_requests == 3
+    assert config.warmup_timeout_s == 120.0
     assert config.debug is False
     assert config.debug_maxlen == 100
 
@@ -41,6 +45,8 @@ def test_rtc_config_custom_initialization():
         prefix_attention_schedule=RTCAttentionSchedule.EXP,
         max_guidance_weight=5.0,
         execution_horizon=20,
+        warmup_requests=2,
+        warmup_timeout_s=30.0,
         debug=True,
         debug_maxlen=200,
     )
@@ -49,6 +55,8 @@ def test_rtc_config_custom_initialization():
     assert config.prefix_attention_schedule == RTCAttentionSchedule.EXP
     assert config.max_guidance_weight == 5.0
     assert config.execution_horizon == 20
+    assert config.warmup_requests == 2
+    assert config.warmup_timeout_s == 30.0
     assert config.debug is True
     assert config.debug_maxlen == 200
 
@@ -63,3 +71,15 @@ def test_rtc_config_partial_initialization():
     assert config.prefix_attention_schedule == RTCAttentionSchedule.LINEAR
     assert config.execution_horizon == 10
     assert config.debug is False
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"warmup_requests": -1}, "warmup_requests must be non-negative"),
+        ({"warmup_timeout_s": 0.0}, "warmup_timeout_s must be positive"),
+    ],
+)
+def test_rtc_config_rejects_invalid_warmup_settings(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        RTCConfig(**kwargs)

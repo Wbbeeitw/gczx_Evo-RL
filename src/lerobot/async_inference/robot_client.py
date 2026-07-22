@@ -141,6 +141,11 @@ class RobotClient:
         self.rtc_request_in_flight = threading.Event()
         self.rtc_request_id = 0
         self.active_rtc_request_id = -1
+        self.rtc_warmup_complete = threading.Event()
+        self.rtc_warmup_request_ids: set[int] = set()
+        self.rtc_warmup_completed_requests = 0
+        if self.rtc_action_queue is None or config.rtc.warmup_requests == 0:
+            self.rtc_warmup_complete.set()
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
         self.latest_captured_observation = None
@@ -307,6 +312,8 @@ class RobotClient:
             self.rtc_request_id += 1
             self.active_rtc_request_id = request_id
             self.rtc_request_in_flight.set()
+            if not self.rtc_warmup_complete.is_set():
+                self.rtc_warmup_request_ids.add(request_id)
             return request_id
 
     def _finish_rtc_request(self, request_id: int) -> None:
@@ -318,8 +325,54 @@ class RobotClient:
 
     def _cancel_active_rtc_request(self) -> None:
         with self.rtc_request_lock:
+            self.rtc_warmup_request_ids.discard(self.active_rtc_request_id)
             self.active_rtc_request_id = -1
             self.rtc_request_in_flight.clear()
+
+    def _is_rtc_warmup_request(self, request_id: int) -> bool:
+        with self.rtc_request_lock:
+            return request_id in self.rtc_warmup_request_ids
+
+    def _complete_rtc_warmup_request(self, request_id: int) -> None:
+        with self.rtc_request_lock:
+            self.rtc_warmup_request_ids.discard(request_id)
+            self.rtc_warmup_completed_requests += 1
+            completed_requests = self.rtc_warmup_completed_requests
+
+        if completed_requests < self.config.rtc.warmup_requests:
+            self.logger.info(
+                "RTC warm-up request %d/%d complete",
+                completed_requests,
+                self.config.rtc.warmup_requests,
+            )
+            return
+
+        self.rtc_action_queue.reset_for_reanchor()
+        self.rtc_latency_tracker.reset()
+        self.must_go.set()
+        self.rtc_warmup_complete.set()
+        self.logger.info("RTC warm-up complete; queue and latency statistics reset")
+
+    def _wait_for_rtc_warmup(self) -> bool:
+        if self.rtc_warmup_complete.is_set():
+            return True
+
+        timeout_s = self.config.rtc.warmup_timeout_s
+        deadline = time.perf_counter() + timeout_s
+        self.logger.info(
+            "Waiting for %d RTC warm-up requests before enabling action execution",
+            self.config.rtc.warmup_requests,
+        )
+        while self.running:
+            remaining_s = deadline - time.perf_counter()
+            if remaining_s <= 0:
+                self.logger.error("RTC warm-up timed out after %.1fs; no actions were executed", timeout_s)
+                self._cancel_active_rtc_request()
+                self.shutdown_event.set()
+                return False
+            if self.rtc_warmup_complete.wait(min(0.1, remaining_s)):
+                return True
+        return False
 
     def _prepare_rtc_metadata(self, request_id: int) -> RTCInferenceMetadata:
         prev_actions, action_count, starvation_count = self.rtc_action_queue.get_rtc_snapshot()
@@ -360,11 +413,12 @@ class RobotClient:
         real_delay = math.ceil(request_latency / self.config.environment_dt)
         self.rtc_latency_tracker.add(request_latency)
         self.action_chunk_size = max(self.action_chunk_size, len(chunk.processed_actions))
+        is_warmup = self._is_rtc_warmup_request(chunk.request_id)
 
         merged = self.rtc_action_queue.merge(
             chunk.original_actions,
             chunk.processed_actions,
-            real_delay,
+            0 if is_warmup else real_delay,
             action_index_before_inference=None,
             action_count_before_inference=chunk.action_count_before_inference,
             starvation_count_before_inference=chunk.starvation_count_before_inference,
@@ -388,6 +442,13 @@ class RobotClient:
                 self.rtc_action_queue.qsize(),
             )
 
+        if is_warmup:
+            if not merged:
+                self.logger.error("RTC warm-up request %d returned no usable actions", chunk.request_id)
+                self._finish_rtc_request(chunk.request_id)
+                self.shutdown_event.set()
+                return
+            self._complete_rtc_warmup_request(chunk.request_id)
         self._finish_rtc_request(chunk.request_id)
 
     def receive_actions(self, verbose: bool = False):
@@ -589,6 +650,8 @@ class RobotClient:
         if self.rtc_action_queue is not None:
             if self.rtc_request_in_flight.is_set():
                 return False
+            if not self.rtc_warmup_complete.is_set():
+                return True
             if self.action_chunk_size <= 0:
                 return True
 
@@ -638,6 +701,15 @@ class RobotClient:
                 request_id = self._begin_rtc_request()
                 try:
                     rtc_metadata = self._prepare_rtc_metadata(request_id)
+                    is_warmup = self._is_rtc_warmup_request(request_id)
+                    if is_warmup:
+                        self.logger.info(
+                            "RTC warm-up request %d/%d prefix=%s horizon=%d",
+                            self.rtc_warmup_completed_requests + 1,
+                            self.config.rtc.warmup_requests,
+                            rtc_metadata.prev_chunk_left_over is not None,
+                            rtc_metadata.execution_horizon,
+                        )
                     observation = TimedObservation(
                         timestamp=observation_timestamp,
                         observation=wire_observation,
@@ -707,6 +779,8 @@ class RobotClient:
         """Execute queued actions independently from camera and network I/O."""
         self.start_barrier.wait()
         self.logger.info("Action control loop starting")
+        if not self._wait_for_rtc_warmup():
+            return self.latest_performed_action
         started_at = time.perf_counter()
         next_action_at = started_at
         first_action_at = None

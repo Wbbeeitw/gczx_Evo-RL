@@ -19,6 +19,7 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import threading
 import time
 from queue import Queue
 
@@ -275,3 +276,94 @@ def test_rtc_metadata_contains_padded_leftover_actions(robot_client):
     assert metadata.action_count_before_inference == 1
     assert metadata.prev_chunk_left_over.shape == (robot_client.config.actions_per_chunk, 3)
     assert torch.equal(metadata.prev_chunk_left_over[:3], actions[1:])
+
+
+def test_rtc_warmup_uses_prefix_then_resets_runtime_state(robot_client):
+    from lerobot.async_inference.helpers import RemoteActionChunk
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    robot_client.config.rtc = RTCConfig(enabled=True, execution_horizon=6, warmup_requests=3)
+    robot_client.rtc_action_queue = ActionQueue(robot_client.config.rtc)
+    robot_client.rtc_warmup_complete.clear()
+    actions = torch.ones(20, len(robot_client.robot.action_features))
+
+    for warmup_index in range(3):
+        assert robot_client._ready_to_send_observation()
+        request_id = robot_client._begin_rtc_request()
+        metadata = robot_client._prepare_rtc_metadata(request_id)
+        assert (metadata.prev_chunk_left_over is None) is (warmup_index == 0)
+        if warmup_index > 0:
+            assert metadata.execution_horizon == 6
+
+        robot_client._merge_rtc_action_chunk(
+            RemoteActionChunk(
+                request_id=request_id,
+                original_actions=actions,
+                processed_actions=actions,
+                observation_timestamp=time.time(),
+                observation_timestep=0,
+                action_count_before_inference=0,
+                starvation_count_before_inference=0,
+            ),
+            receive_time=time.time(),
+        )
+
+    assert robot_client.rtc_warmup_complete.is_set()
+    assert robot_client.rtc_action_queue.empty()
+    assert len(robot_client.rtc_latency_tracker) == 0
+    assert robot_client.get_executed_action_count() == 0
+
+
+def test_rtc_warmup_blocks_actions_and_duration_starts_after_completion(monkeypatch, robot_client):
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    robot_client.config.rtc = RTCConfig(enabled=True, warmup_requests=1, warmup_timeout_s=1.0)
+    robot_client.config.duration = 0.05
+    robot_client.rtc_action_queue = ActionQueue(robot_client.config.rtc)
+    robot_client.rtc_warmup_complete.clear()
+    actions = torch.ones(3, len(robot_client.robot.action_features))
+    assert robot_client.rtc_action_queue.merge(actions, actions, real_delay=0)
+    robot_client.start_barrier = type("ImmediateBarrier", (), {"wait": lambda self: None})()
+    sent_actions = []
+
+    def record_action(action):
+        sent_actions.append((time.perf_counter(), action))
+        return action
+
+    monkeypatch.setattr(robot_client.robot, "send_action", record_action)
+
+    warmup_delay_s = 0.08
+    timer = threading.Timer(warmup_delay_s, robot_client.rtc_warmup_complete.set)
+    started_at = time.perf_counter()
+    timer.start()
+    try:
+        robot_client.action_control_loop()
+    finally:
+        timer.cancel()
+
+    assert time.perf_counter() - started_at >= warmup_delay_s + robot_client.config.duration
+    assert sent_actions
+    assert sent_actions[0][0] - started_at >= warmup_delay_s
+
+
+def test_rtc_warmup_timeout_stops_without_sending_actions(monkeypatch, robot_client):
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    robot_client.config.rtc = RTCConfig(enabled=True, warmup_requests=1, warmup_timeout_s=0.02)
+    robot_client.rtc_action_queue = ActionQueue(robot_client.config.rtc)
+    robot_client.rtc_warmup_complete.clear()
+    actions = torch.ones(3, len(robot_client.robot.action_features))
+    assert robot_client.rtc_action_queue.merge(actions, actions, real_delay=0)
+    robot_client.start_barrier = type("ImmediateBarrier", (), {"wait": lambda self: None})()
+    monkeypatch.setattr(
+        robot_client.robot,
+        "send_action",
+        lambda _: pytest.fail("warm-up timeout must fail closed before sending actions"),
+    )
+
+    assert robot_client.action_control_loop() is None
+    assert robot_client.shutdown_event.is_set()
+    assert robot_client.get_executed_action_count() == 0

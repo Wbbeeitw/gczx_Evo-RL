@@ -2,6 +2,8 @@
 
 本流程使用工控机作为 robot client、GPU 服务器作为 policy server。client 将三路 RGB 和右夹爪触觉热力图压缩为 JPEG 后发送至 server；server 使用 XR0 生成带旧动作前缀的 action suffix，client 根据实测延迟替换并平滑 action queue。
 
+client 在允许动作执行前默认完成 3 次 RTC warm-up：第 1 次建立无 prefix 的 anchor，第 2、3 次使用上一 warm-up chunk 进行 prefix-conditioned 推理。warm-up chunk 不会发送给机器人；完成后 client 清空 warm-up action queue 和延迟统计，再从最新 observation 请求正式 anchor。`duration` 也从 warm-up 完成后才开始计时。
+
 ## 约束
 
 - client 和 server 必须运行同一个 Git commit。
@@ -77,6 +79,8 @@ PYTHONUNBUFFERED=1 python -m lerobot.async_inference.robot_client \
   --rtc.max_guidance_weight=1.0 \
   --rtc.queue_blend_steps=3 \
   --rtc.inference_delay_multiplier=1.0 \
+  --rtc.warmup_requests=3 \
+  --rtc.warmup_timeout_s=120 \
   --observation_image_codec=jpeg \
   --observation_jpeg_quality=90 \
   --dry_run_actions=true \
@@ -97,5 +101,16 @@ starvation/reanchor 次数
 action shape 是否为 14
 左臂 action 是否保持当前状态
 ```
+
+warm-up 正常完成时应依次看到：
+
+```text
+RTC warm-up request 1/3 prefix=False horizon=6
+RTC warm-up request 2/3 prefix=True horizon=6
+RTC warm-up request 3/3 prefix=True horizon=6
+RTC warm-up complete; queue and latency statistics reset
+```
+
+warm-up 超过 `rtc.warmup_timeout_s` 时 client 会安全停止并断开设备，不会执行 warm-up action。不要通过设置 `rtc.warmup_requests=0` 跳过首次真实硬件测试的 warm-up。
 
 所有检查通过后，才将 `enable_on_connect` 改为 `true`、将 `dry_run_actions` 改为 `false`，并继续保持 `speed_ratio=2`、`duration=5` 做首次真实动作测试。

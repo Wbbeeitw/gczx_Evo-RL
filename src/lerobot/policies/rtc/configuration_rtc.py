@@ -44,6 +44,8 @@ class RTCConfig:
     execution_horizon: int = 10
     queue_blend_steps: int = 0
     inference_delay_multiplier: float = 1.0
+    warmup_requests: int = 3
+    warmup_timeout_s: float = 120.0
 
     # Debug settings
     debug: bool = False
@@ -62,5 +64,9 @@ class RTCConfig:
                 "inference_delay_multiplier must be positive, "
                 f"got {self.inference_delay_multiplier}"
             )
+        if self.warmup_requests < 0:
+            raise ValueError(f"warmup_requests must be non-negative, got {self.warmup_requests}")
+        if self.warmup_timeout_s <= 0:
+            raise ValueError(f"warmup_timeout_s must be positive, got {self.warmup_timeout_s}")
         if self.debug_maxlen <= 0:
             raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")
