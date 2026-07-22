@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.robots.config import RobotConfig
 
 from .constants import (
@@ -143,6 +144,24 @@ class RobotClientConfig:
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
 
+    rtc: RTCConfig = field(default_factory=RTCConfig)
+    dry_run_actions: bool = field(
+        default=False,
+        metadata={"help": "Advance the action queue without sending commands to the robot"},
+    )
+    duration: float = field(
+        default=0.0,
+        metadata={"help": "Optional client runtime in seconds; zero runs until interrupted"},
+    )
+    observation_image_codec: str = field(
+        default="raw",
+        metadata={"help": "Image transport codec. Supported values: raw, jpeg"},
+    )
+    observation_jpeg_quality: int = field(
+        default=90,
+        metadata={"help": "JPEG quality used when observation_image_codec=jpeg"},
+    )
+
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
@@ -179,6 +198,22 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.duration < 0:
+            raise ValueError(f"duration must be non-negative, got {self.duration}")
+
+        self.observation_image_codec = self.observation_image_codec.lower()
+        if self.observation_image_codec not in {"raw", "jpeg"}:
+            raise ValueError(
+                "observation_image_codec must be one of ['raw', 'jpeg'], "
+                f"got {self.observation_image_codec}"
+            )
+
+        if self.observation_jpeg_quality < 1 or self.observation_jpeg_quality > 100:
+            raise ValueError(
+                "observation_jpeg_quality must be between 1 and 100, "
+                f"got {self.observation_jpeg_quality}"
+            )
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -200,4 +235,9 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "rtc": self.rtc,
+            "dry_run_actions": self.dry_run_actions,
+            "duration": self.duration,
+            "observation_image_codec": self.observation_image_codec,
+            "observation_jpeg_quality": self.observation_jpeg_quality,
         }

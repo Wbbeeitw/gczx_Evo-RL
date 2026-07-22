@@ -34,6 +34,7 @@ python src/lerobot/async_inference/robot_client.py \
 """
 
 import logging
+import math
 import pickle  # nosec
 import threading
 import time
@@ -49,6 +50,9 @@ import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.tactile.configuration_tactile import TactileCameraConfig  # noqa: F401
+from lerobot.policies.rtc.action_queue import ActionQueue
+from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -72,10 +76,13 @@ from .helpers import (
     Action,
     FPSTracker,
     Observation,
+    RTCInferenceMetadata,
     RawObservation,
+    RemoteActionChunk,
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    encode_observation_images,
     get_logger,
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
@@ -108,6 +115,7 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rtc_config=config.rtc,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -120,14 +128,25 @@ class RobotClient:
         # Initialize client side variables
         self.latest_action_lock = threading.Lock()
         self.latest_action = -1
+        self.executed_action_count = 0
         self.action_chunk_size = -1
 
         self._chunk_size_threshold = config.chunk_size_threshold
 
         self.action_queue = Queue()
         self.action_queue_lock = threading.Lock()  # Protect queue operations
+        self.rtc_action_queue = ActionQueue(config.rtc) if config.rtc.enabled else None
+        self.rtc_latency_tracker = LatencyTracker()
+        self.rtc_request_lock = threading.Lock()
+        self.rtc_request_in_flight = threading.Event()
+        self.rtc_request_id = 0
+        self.active_rtc_request_id = -1
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
+        self.latest_captured_observation = None
+        self.latest_performed_action = None
+        self.last_action_send_duration_s = 0.0
+        self.max_action_send_duration_s = 0.0
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
@@ -175,12 +194,12 @@ class RobotClient:
     def stop(self):
         """Stop the robot client"""
         self.shutdown_event.set()
-
-        self.robot.disconnect()
-        self.logger.debug("Robot disconnected")
-
-        self.channel.close()
-        self.logger.debug("Client stopped, channel closed")
+        try:
+            self.robot.disconnect()
+            self.logger.debug("Robot disconnected")
+        finally:
+            self.channel.close()
+            self.logger.debug("Client stopped, channel closed")
 
     def send_observation(
         self,
@@ -200,6 +219,7 @@ class RobotClient:
         self.logger.debug(f"Observation serialization time: {serialize_time:.6f}s")
 
         try:
+            rpc_started_at = time.perf_counter()
             observation_iterator = send_bytes_in_chunks(
                 observation_bytes,
                 services_pb2.Observation,
@@ -207,8 +227,17 @@ class RobotClient:
                 silent=True,
             )
             _ = self.stub.SendObservations(observation_iterator)
+            rpc_time = time.perf_counter() - rpc_started_at
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
+            if self.config.observation_image_codec != "raw":
+                self.logger.info(
+                    "Observation transport step=%d payload=%.1fKiB serialize=%.1fms rpc=%.1fms",
+                    obs_timestep,
+                    len(observation_bytes) / 1024.0,
+                    serialize_time * 1000.0,
+                    rpc_time * 1000.0,
+                )
 
             return True
 
@@ -227,6 +256,7 @@ class RobotClient:
         self,
         incoming_actions: list[TimedAction],
         aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        replace_existing: bool = False,
     ):
         """Finds the same timestep actions in the queue and aggregates them using the aggregate_fn"""
         if aggregate_fn is None:
@@ -234,39 +264,131 @@ class RobotClient:
             def aggregate_fn(x1, x2):
                 return x2
 
-        future_action_queue = Queue()
+        with self.latest_action_lock:
+            latest_action = self.latest_action
+
         with self.action_queue_lock:
-            internal_queue = self.action_queue.queue
-
-        current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
-
-        for new_action in incoming_actions:
-            with self.latest_action_lock:
-                latest_action = self.latest_action
-
-            # New action is older than the latest action in the queue, skip it
-            if new_action.get_timestep() <= latest_action:
-                continue
-
-            # If the new action's timestep is not in the current action queue, add it directly
-            elif new_action.get_timestep() not in current_action_queue:
-                future_action_queue.put(new_action)
-                continue
-
-            # If the new action's timestep is in the current action queue, aggregate it
-            # TODO: There is probably a way to do this with broadcasting of the two action tensors
-            future_action_queue.put(
-                TimedAction(
-                    timestamp=new_action.get_timestamp(),
-                    timestep=new_action.get_timestep(),
-                    action=aggregate_fn(
-                        current_action_queue[new_action.get_timestep()], new_action.get_action()
-                    ),
-                )
+            queued_actions = (
+                {}
+                if replace_existing
+                else {
+                    action.get_timestep(): action
+                    for action in self.action_queue.queue
+                    if action.get_timestep() > latest_action
+                }
             )
 
-        with self.action_queue_lock:
+            for new_action in incoming_actions:
+                timestep = new_action.get_timestep()
+                if timestep <= latest_action:
+                    continue
+
+                old_action = queued_actions.get(timestep)
+                if old_action is None:
+                    queued_actions[timestep] = new_action
+                    continue
+
+                queued_actions[timestep] = TimedAction(
+                    timestamp=new_action.get_timestamp(),
+                    timestep=timestep,
+                    action=aggregate_fn(old_action.get_action(), new_action.get_action()),
+                )
+
+            future_action_queue = Queue()
+            for timestep in sorted(queued_actions):
+                future_action_queue.put(queued_actions[timestep])
             self.action_queue = future_action_queue
+
+    def _begin_rtc_request(self) -> int:
+        with self.rtc_request_lock:
+            if self.rtc_request_in_flight.is_set():
+                raise RuntimeError("An RTC inference request is already in flight.")
+            request_id = self.rtc_request_id
+            self.rtc_request_id += 1
+            self.active_rtc_request_id = request_id
+            self.rtc_request_in_flight.set()
+            return request_id
+
+    def _finish_rtc_request(self, request_id: int) -> None:
+        with self.rtc_request_lock:
+            if request_id != self.active_rtc_request_id:
+                return
+            self.active_rtc_request_id = -1
+            self.rtc_request_in_flight.clear()
+
+    def _cancel_active_rtc_request(self) -> None:
+        with self.rtc_request_lock:
+            self.active_rtc_request_id = -1
+            self.rtc_request_in_flight.clear()
+
+    def _prepare_rtc_metadata(self, request_id: int) -> RTCInferenceMetadata:
+        prev_actions, action_count, starvation_count = self.rtc_action_queue.get_rtc_snapshot()
+        execution_horizon = self.config.rtc.execution_horizon
+        if prev_actions is not None:
+            leftover_len = len(prev_actions)
+            if leftover_len <= 0:
+                prev_actions = None
+                execution_horizon = 0
+            else:
+                execution_horizon = min(execution_horizon, leftover_len)
+                padded = prev_actions.new_zeros(
+                    (self.config.actions_per_chunk, prev_actions.shape[-1])
+                )
+                copy_steps = min(leftover_len, self.config.actions_per_chunk)
+                padded[:copy_steps] = prev_actions[:copy_steps]
+                prev_actions = padded.cpu()
+
+        median_latency = self.rtc_latency_tracker.percentile(0.5) or 0.0
+        estimated_delay_steps = (
+            self.config.rtc.inference_delay_multiplier
+            * median_latency
+            / self.config.environment_dt
+        )
+        inference_delay = math.ceil(max(0.0, estimated_delay_steps - 1e-6))
+        inference_delay = min(inference_delay, execution_horizon)
+        return RTCInferenceMetadata(
+            request_id=request_id,
+            prev_chunk_left_over=prev_actions,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+            action_count_before_inference=action_count,
+            starvation_count_before_inference=starvation_count,
+        )
+
+    def _merge_rtc_action_chunk(self, chunk: RemoteActionChunk, receive_time: float) -> None:
+        request_latency = max(0.0, receive_time - chunk.observation_timestamp)
+        real_delay = math.ceil(request_latency / self.config.environment_dt)
+        self.rtc_latency_tracker.add(request_latency)
+        self.action_chunk_size = max(self.action_chunk_size, len(chunk.processed_actions))
+
+        merged = self.rtc_action_queue.merge(
+            chunk.original_actions,
+            chunk.processed_actions,
+            real_delay,
+            action_index_before_inference=None,
+            action_count_before_inference=chunk.action_count_before_inference,
+            starvation_count_before_inference=chunk.starvation_count_before_inference,
+        )
+        if not merged:
+            self.rtc_action_queue.reset_for_reanchor()
+            self.rtc_latency_tracker.reset()
+            self.must_go.set()
+            self.logger.warning(
+                "RTC chunk request=%d had no future actions; requesting a fresh anchor",
+                chunk.request_id,
+            )
+        else:
+            self.must_go.set()
+            self.logger.info(
+                "RTC chunk request=%d inference=%.1fms round_trip=%.1fms consumed=%d queue=%d",
+                chunk.request_id,
+                chunk.inference_time_s * 1000.0,
+                request_latency * 1000.0,
+                self.rtc_action_queue.last_replace_real_delay,
+                self.rtc_action_queue.qsize(),
+            )
+
+        self._finish_rtc_request(chunk.request_id)
 
     def receive_actions(self, verbose: bool = False):
         """Receive actions from the policy server"""
@@ -287,6 +409,10 @@ class RobotClient:
                 deserialize_start = time.perf_counter()
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
+
+                if isinstance(timed_actions, RemoteActionChunk):
+                    self._merge_rtc_action_chunk(timed_actions, receive_time)
+                    continue
 
                 # Log device type of received actions
                 if len(timed_actions) > 0:
@@ -359,32 +485,88 @@ class RobotClient:
 
             except grpc.RpcError as e:
                 self.logger.error(f"Error receiving actions: {e}")
+                if self.rtc_action_queue is not None:
+                    self._cancel_active_rtc_request()
+                    self.must_go.set()
 
     def actions_available(self):
         """Check if there are actions available in the queue"""
+        if self.rtc_action_queue is not None:
+            return not self.rtc_action_queue.empty()
         with self.action_queue_lock:
             return not self.action_queue.empty()
 
+    def get_executed_action_count(self) -> int:
+        if self.rtc_action_queue is not None:
+            return self.rtc_action_queue.get_action_count()
+        with self.latest_action_lock:
+            return self.executed_action_count
+
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
+        if action_tensor.numel() != len(self.robot.action_features):
+            raise ValueError(
+                f"Received action with {action_tensor.numel()} values, but robot expects "
+                f"{len(self.robot.action_features)}"
+            )
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
 
-    def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
+    def control_loop_action(self, verbose: bool = False) -> dict[str, Any] | None:
         """Reading and performing actions in local queue"""
 
-        # Lock only for queue operations
+        if self.rtc_action_queue is not None:
+            action_tensor = self.rtc_action_queue.get_for_execution()
+            if action_tensor is None:
+                return None
+
+            action_dict = self._action_tensor_to_action_dict(action_tensor)
+            send_started_at = time.perf_counter()
+            try:
+                performed_action = (
+                    action_dict if self.config.dry_run_actions else self.robot.send_action(action_dict)
+                )
+            except Exception:
+                self.rtc_action_queue.mark_action_failed()
+                raise
+            self.last_action_send_duration_s = time.perf_counter() - send_started_at
+            self.max_action_send_duration_s = max(
+                self.max_action_send_duration_s, self.last_action_send_duration_s
+            )
+
+            self.rtc_action_queue.mark_action_sent(action_tensor)
+            with self.latest_action_lock:
+                self.latest_action = self.rtc_action_queue.get_action_count() - 1
+                self.executed_action_count = self.rtc_action_queue.get_action_count()
+            return performed_action
+
         get_start = time.perf_counter()
+        with self.latest_action_lock:
+            latest_action = self.latest_action
         with self.action_queue_lock:
             self.action_queue_size.append(self.action_queue.qsize())
-            # Get action from queue
-            timed_action = self.action_queue.get_nowait()
+            timed_action = None
+            while not self.action_queue.empty():
+                candidate = self.action_queue.get_nowait()
+                if candidate.get_timestep() > latest_action:
+                    timed_action = candidate
+                    break
         get_end = time.perf_counter() - get_start
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
+        if timed_action is None:
+            return None
+
+        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        send_started_at = time.perf_counter()
+        performed_action = (
+            action_dict if self.config.dry_run_actions else self.robot.send_action(action_dict)
+        )
+        self.last_action_send_duration_s = time.perf_counter() - send_started_at
+        self.max_action_send_duration_s = max(
+            self.max_action_send_duration_s, self.last_action_send_duration_s
         )
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+            self.executed_action_count += 1
 
         if verbose:
             with self.action_queue_lock:
@@ -400,27 +582,91 @@ class RobotClient:
                 f"Popping action from queue to perform took {get_end:.6f}s | Queue size: {current_queue_size}"
             )
 
-        return _performed_action
+        return performed_action
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
+        if self.rtc_action_queue is not None:
+            if self.rtc_request_in_flight.is_set():
+                return False
+            if self.action_chunk_size <= 0:
+                return True
+
+            configured_threshold = math.floor(self.action_chunk_size * self._chunk_size_threshold)
+            horizon_threshold = max(0, self.action_chunk_size - self.config.rtc.execution_horizon)
+            p95_latency = self.rtc_latency_tracker.p95() or 0.0
+            latency_threshold = math.ceil(p95_latency / self.config.environment_dt) + 2
+            refill_threshold = min(
+                self.action_chunk_size - 1,
+                max(configured_threshold, horizon_threshold, latency_threshold),
+            )
+            return self.rtc_action_queue.qsize() <= refill_threshold
+
         with self.action_queue_lock:
+            if self.action_chunk_size <= 0:
+                return True
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
-    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation | None:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
+            observation_timestamp = time.time()
+
+            wire_observation, codec_stats = encode_observation_images(
+                raw_observation,
+                codec=self.config.observation_image_codec,
+                jpeg_quality=self.config.observation_jpeg_quality,
+            )
+            if codec_stats.image_count > 0:
+                compression_ratio = codec_stats.raw_bytes / max(codec_stats.encoded_bytes, 1)
+                self.logger.info(
+                    "Observation images codec=%s count=%d raw=%.1fKiB encoded=%.1fKiB "
+                    "compression=%.2fx encode=%.1fms",
+                    self.config.observation_image_codec,
+                    codec_stats.image_count,
+                    codec_stats.raw_bytes / 1024.0,
+                    codec_stats.encoded_bytes / 1024.0,
+                    compression_ratio,
+                    codec_stats.elapsed_s * 1000.0,
+                )
+
+            if self.rtc_action_queue is not None:
+                request_id = self._begin_rtc_request()
+                try:
+                    rtc_metadata = self._prepare_rtc_metadata(request_id)
+                    observation = TimedObservation(
+                        timestamp=observation_timestamp,
+                        observation=wire_observation,
+                        timestep=rtc_metadata.action_count_before_inference,
+                        must_go=True,
+                        rtc=rtc_metadata,
+                    )
+                    sent = self.send_observation(observation)
+                    if not sent:
+                        self._finish_rtc_request(request_id)
+                    self.logger.info(
+                        "RTC observation request=%d step=%d queue=%d delay=%d horizon=%d",
+                        request_id,
+                        observation.get_timestep(),
+                        self.rtc_action_queue.qsize(),
+                        rtc_metadata.inference_delay,
+                        rtc_metadata.execution_horizon,
+                    )
+                    return raw_observation
+                except Exception:
+                    self._finish_rtc_request(request_id)
+                    raise
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
 
             observation = TimedObservation(
-                timestamp=time.time(),  # need time.time() to compare timestamps across client and server
-                observation=raw_observation,
+                timestamp=observation_timestamp,
+                observation=wire_observation,
                 timestep=max(latest_action, 0),
             )
 
@@ -457,30 +703,109 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 
-    def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
-        """Combined function for executing actions and streaming observations"""
-        # Wait at barrier for synchronized start
+    def action_control_loop(self, verbose: bool = False) -> Action | None:
+        """Execute queued actions independently from camera and network I/O."""
         self.start_barrier.wait()
-        self.logger.info("Control loop thread starting")
-
-        _performed_action = None
-        _captured_observation = None
+        self.logger.info("Action control loop starting")
+        started_at = time.perf_counter()
+        next_action_at = started_at
+        first_action_at = None
+        first_action_count = 0
+        missed_deadlines = 0
+        max_deadline_lag_s = 0.0
+        log_interval = max(1, round(self.config.fps))
 
         while self.running:
+            now = time.perf_counter()
+            if self.config.duration > 0 and now - started_at >= self.config.duration:
+                self.logger.info("Stopping because duration reached %.1fs", self.config.duration)
+                self.shutdown_event.set()
+                break
+
+            wait_s = next_action_at - now
+            if wait_s > 0 and self.shutdown_event.wait(wait_s):
+                break
+
             control_loop_start = time.perf_counter()
-            """Control loop: (1) Performing actions, when available"""
+            action_count_before = self.get_executed_action_count()
             if self.actions_available():
-                _performed_action = self.control_loop_action(verbose)
+                performed_action = self.control_loop_action(verbose)
+                if self.get_executed_action_count() > action_count_before:
+                    self.latest_performed_action = performed_action
 
-            """Control loop: (2) Streaming observations to the remote policy server"""
+            action_count_after = self.get_executed_action_count()
+            if action_count_after > action_count_before:
+                if first_action_at is None:
+                    first_action_at = control_loop_start
+                    first_action_count = action_count_before
+                if action_count_after % log_interval == 0:
+                    elapsed_s = time.perf_counter() - first_action_at
+                    queue_size = (
+                        self.rtc_action_queue.qsize()
+                        if self.rtc_action_queue is not None
+                        else self.action_queue.qsize()
+                    )
+                    self.logger.info(
+                        "Action #%d queue=%d send=%.1fms max_send=%.1fms "
+                        "effective_hz=%.2f missed_deadlines=%d max_lag=%.1fms dry_run=%s",
+                        action_count_after,
+                        queue_size,
+                        self.last_action_send_duration_s * 1000.0,
+                        self.max_action_send_duration_s * 1000.0,
+                        (action_count_after - first_action_count) / max(elapsed_s, 1e-6),
+                        missed_deadlines,
+                        max_deadline_lag_s * 1000.0,
+                        self.config.dry_run_actions,
+                    )
+
+            self.logger.debug(
+                f"Action control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}"
+            )
+            next_action_at += self.config.environment_dt
+            deadline_lag_s = time.perf_counter() - next_action_at
+            if deadline_lag_s > 0:
+                missed_deadlines += 1
+                max_deadline_lag_s = max(max_deadline_lag_s, deadline_lag_s)
+                if deadline_lag_s > self.config.environment_dt:
+                    next_action_at = time.perf_counter() + self.config.environment_dt
+
+        return self.latest_performed_action
+
+    def observation_loop(self, task: str, verbose: bool = False) -> Observation | None:
+        """Capture and send observations independently from action execution."""
+        self.logger.info("Observation loop starting")
+
+        while self.running:
+            observation_loop_start = time.perf_counter()
             if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                captured_observation = self.control_loop_observation(task, verbose)
+                if captured_observation is not None:
+                    self.latest_captured_observation = captured_observation
 
-            self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
-            # Dynamically adjust sleep time to maintain the desired control frequency
-            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+            self.logger.debug(
+                f"Observation loop (ms): {(time.perf_counter() - observation_loop_start) * 1000:.2f}"
+            )
+            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - observation_loop_start)))
 
-        return _captured_observation, _performed_action
+        return self.latest_captured_observation
+
+    def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
+        """Run independent action and observation loops."""
+        observation_thread = threading.Thread(
+            target=self.observation_loop,
+            args=(task, verbose),
+            daemon=True,
+            name="robot-observation-loop",
+        )
+        observation_thread.start()
+
+        try:
+            self.action_control_loop(verbose)
+        finally:
+            self.shutdown_event.set()
+            observation_thread.join(timeout=max(1.0, 2 * self.config.environment_dt))
+
+        return self.latest_captured_observation, self.latest_performed_action
 
 
 @draccus.wrap()
@@ -491,26 +816,22 @@ def async_client(cfg: RobotClientConfig):
         raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
 
     client = RobotClient(cfg)
-
-    if client.start():
+    action_receiver_thread = None
+    try:
+        if not client.start():
+            raise RuntimeError("Failed to start async inference client.")
         client.logger.info("Starting action receiver thread...")
 
-        # Create and start action receiver thread
         action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
-
-        # Start action receiver thread
         action_receiver_thread.start()
-
-        try:
-            # The main thread runs the control loop
-            client.control_loop(task=cfg.task)
-
-        finally:
-            client.stop()
-            action_receiver_thread.join()
-            if cfg.debug_visualize_queue_size:
-                visualize_action_queue_size(client.action_queue_size)
-            client.logger.info("Client stopped")
+        client.control_loop(task=cfg.task)
+    finally:
+        client.stop()
+        if action_receiver_thread is not None:
+            action_receiver_thread.join(timeout=5.0)
+        if cfg.debug_visualize_queue_size:
+            visualize_action_queue_size(client.action_queue_size)
+        client.logger.info("Client stopped")
 
 
 if __name__ == "__main__":

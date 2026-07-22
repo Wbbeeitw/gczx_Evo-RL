@@ -103,6 +103,7 @@ class XR0Policy(PreTrainedPolicy):
 
     config_class = XR0Config
     name = "xr0"
+    supports_rtc = True
 
     def __init__(self, config: XR0Config, **kwargs):
         super().__init__(config)
@@ -425,6 +426,66 @@ class XR0Policy(PreTrainedPolicy):
         std = self._xr0_action_std.to(device=action.device, dtype=action.dtype)
         return action * (std + 1e-6) + mean
 
+    def _normalize_native_action(self, action: Tensor) -> Tensor:
+        if not bool(self._xr0_action_stats_loaded.item()):
+            return action
+        mean = self._xr0_action_mean.to(device=action.device, dtype=action.dtype)
+        std = self._xr0_action_std.to(device=action.device, dtype=action.dtype)
+        mean = mean[: action.shape[-2]]
+        std = std[: action.shape[-2]]
+        return (action - mean) / (std + 1e-6)
+
+    def _apply_rtc_prefix(
+        self,
+        native_batch: dict[str, Any],
+        prev_chunk_left_over: Tensor | None,
+        execution_horizon: int,
+    ) -> int:
+        if prev_chunk_left_over is None or execution_horizon <= 0:
+            return 0
+
+        prefix = prev_chunk_left_over.to(device=self.device, dtype=native_batch["action"].dtype)
+        if prefix.ndim == 2:
+            prefix = prefix.unsqueeze(0)
+        if prefix.ndim != 3:
+            raise ValueError(
+                "XR0 RTC prefix must have shape (horizon, action_dim) or "
+                f"(batch, horizon, action_dim), got {tuple(prefix.shape)}"
+            )
+        if prefix.shape[0] != native_batch["action"].shape[0]:
+            if prefix.shape[0] == 1:
+                prefix = prefix.expand(native_batch["action"].shape[0], -1, -1)
+            else:
+                raise ValueError(
+                    f"XR0 RTC prefix batch size {prefix.shape[0]} does not match "
+                    f"observation batch size {native_batch['action'].shape[0]}"
+                )
+        if prefix.shape[-1] != self.config.max_action_dim:
+            raise ValueError(
+                f"XR0 RTC prefix action dimension must be {self.config.max_action_dim}, "
+                f"got {prefix.shape[-1]}"
+            )
+
+        prefix_length = min(
+            int(execution_horizon),
+            prefix.shape[1],
+            native_batch["action"].shape[1],
+        )
+        if prefix_length <= 0:
+            return 0
+
+        prefix = prefix[:, :prefix_length]
+        state = native_batch["state"]
+        if state.ndim == 2:
+            state = state.unsqueeze(1)
+        if not self.config.actions_are_delta:
+            prefix = prefix - state
+        prefix = self._normalize_native_action(prefix)
+
+        native_batch["action"][:, :prefix_length] = prefix
+        native_batch["prefix_length"] = prefix_length
+        return prefix_length
+
     def _restore_absolute_action(self, action: Tensor, state: Tensor) -> Tensor:
         if self.config.actions_are_delta:
             return action
@@ -483,11 +544,22 @@ class XR0Policy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         self.eval()
         native_batch = self._prepare_native_batch(batch, include_action=False)
+        prefix_length = self._apply_rtc_prefix(
+            native_batch,
+            kwargs.get("prev_chunk_left_over"),
+            int(kwargs.get("execution_horizon", 0)),
+        )
         state = native_batch["state"]
         actions = self.model.generate(native_batch)
         actions = self._unnormalize_native_action(actions)
         actions = self._restore_absolute_action(actions, state)
         actions = self._hold_uncontrolled_action_dims(actions, state)
+        if prefix_length > 0:
+            logger.debug(
+                "XR0 generated RTC suffix with prefix_length=%d inference_delay=%s",
+                prefix_length,
+                kwargs.get("inference_delay", 0),
+            )
         return actions[:, :, : self.config.max_action_dim]
 
     def _get_default_peft_targets(self) -> dict:

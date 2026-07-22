@@ -231,3 +231,47 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+def test_rtc_dry_run_does_not_send_robot_action(monkeypatch, robot_client):
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    robot_client.config.dry_run_actions = True
+    robot_client.config.rtc = RTCConfig(enabled=True, execution_horizon=5)
+    robot_client.rtc_action_queue = ActionQueue(robot_client.config.rtc)
+    actions = torch.ones(3, len(robot_client.robot.action_features))
+    assert robot_client.rtc_action_queue.merge(actions, actions, real_delay=0)
+
+    monkeypatch.setattr(
+        robot_client.robot,
+        "send_action",
+        lambda _: pytest.fail("dry-run must not call robot.send_action"),
+    )
+
+    performed_action = robot_client.control_loop_action()
+
+    assert performed_action == {
+        key: 1.0 for key in robot_client.robot.action_features
+    }
+    assert robot_client.rtc_action_queue.get_action_count() == 1
+
+
+def test_rtc_metadata_contains_padded_leftover_actions(robot_client):
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    robot_client.config.rtc = RTCConfig(enabled=True, execution_horizon=2)
+    robot_client.rtc_action_queue = ActionQueue(robot_client.config.rtc)
+    actions = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    assert robot_client.rtc_action_queue.merge(actions, actions, real_delay=0)
+    action = robot_client.rtc_action_queue.get_for_execution()
+    robot_client.rtc_action_queue.mark_action_sent(action)
+
+    metadata = robot_client._prepare_rtc_metadata(request_id=7)
+
+    assert metadata.request_id == 7
+    assert metadata.execution_horizon == 2
+    assert metadata.action_count_before_inference == 1
+    assert metadata.prev_chunk_left_over.shape == (robot_client.config.actions_per_chunk, 3)
+    assert torch.equal(metadata.prev_chunk_left_over[:3], actions[1:])

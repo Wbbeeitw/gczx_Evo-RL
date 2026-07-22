@@ -48,15 +48,19 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
+from lerobot.utils.constants import OBS_IMAGES
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
 from .helpers import (
     FPSTracker,
     Observation,
+    RTCInferenceMetadata,
+    RemoteActionChunk,
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    decode_observation_images,
     get_logger,
     observations_similar,
     raw_observation_to_observation,
@@ -86,6 +90,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = None
         self.lerobot_features = None
         self.actions_per_chunk = None
+        self.rtc_config = None
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
@@ -147,11 +152,50 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
+        self.rtc_config = policy_specs.rtc_config
 
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        policy_chunk_size = getattr(self.policy.config, "chunk_size", self.actions_per_chunk)
+        if self.actions_per_chunk > policy_chunk_size:
+            raise ValueError(
+                f"actions_per_chunk ({self.actions_per_chunk}) exceeds policy chunk_size "
+                f"({policy_chunk_size})"
+            )
+        if (
+            self.rtc_config is not None
+            and self.rtc_config.enabled
+            and self.rtc_config.execution_horizon > self.actions_per_chunk
+        ):
+            raise ValueError(
+                f"RTC execution_horizon ({self.rtc_config.execution_horizon}) exceeds "
+                f"actions_per_chunk ({self.actions_per_chunk})"
+            )
+
+        expected_image_keys = set(self.policy.config.image_features)
+        client_image_keys = {
+            key for key in self.lerobot_features if key.startswith(OBS_IMAGES)
+        }
+        if client_image_keys != expected_image_keys:
+            raise ValueError(
+                "Robot image features do not match policy checkpoint. "
+                f"Missing: {sorted(expected_image_keys - client_image_keys)}; "
+                f"unexpected: {sorted(client_image_keys - expected_image_keys)}"
+            )
+
+        if self.rtc_config is not None and self.rtc_config.enabled:
+            if not (
+                getattr(self.policy, "supports_rtc", False)
+                or hasattr(self.policy, "init_rtc_processor")
+            ):
+                raise ValueError(f"Policy type '{self.policy_type}' does not support RTC inference.")
+            self.policy.config.rtc_config = self.rtc_config
+            if hasattr(self.policy, "init_rtc_processor"):
+                self.policy.init_rtc_processor()
+        if hasattr(self.policy, "reset"):
+            self.policy.reset()
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -184,6 +228,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )  # blocking call while looping over request_iterator
         timed_observation = pickle.loads(received_bytes)  # nosec
         deserialize_time = time.perf_counter() - start_deserialize
+        decoded_observation, codec_stats = decode_observation_images(
+            timed_observation.get_observation()
+        )
+        timed_observation.observation = decoded_observation
+        if codec_stats.image_count > 0:
+            compression_ratio = codec_stats.raw_bytes / max(codec_stats.encoded_bytes, 1)
+            self.logger.info(
+                "Observation images decoded count=%d encoded=%.1fKiB raw=%.1fKiB "
+                "compression=%.2fx decode=%.1fms",
+                codec_stats.image_count,
+                codec_stats.encoded_bytes / 1024.0,
+                codec_stats.raw_bytes / 1024.0,
+                compression_ratio,
+                codec_stats.elapsed_s * 1000.0,
+            )
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
 
@@ -264,8 +323,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         except Exception as e:
             self.logger.error(f"Error in StreamActions: {e}")
-
-            return services_pb2.Empty()
+            context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
         """Check if the observation is valid to be processed by the policy"""
@@ -321,15 +379,32 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _get_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        rtc: RTCInferenceMetadata | None = None,
+    ) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        predict_kwargs = {}
+        if rtc is not None:
+            prev_chunk_left_over = rtc.prev_chunk_left_over
+            if prev_chunk_left_over is not None:
+                prev_chunk_left_over = prev_chunk_left_over.to(self.device)
+            predict_kwargs = {
+                "prev_chunk_left_over": prev_chunk_left_over,
+                "inference_delay": rtc.inference_delay,
+                "execution_horizon": rtc.execution_horizon,
+            }
+
+        chunk = self.policy.predict_action_chunk(observation, **predict_kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
         return chunk[:, : self.actions_per_chunk, :]
 
-    def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
+    def _predict_action_chunk(
+        self, observation_t: TimedObservation
+    ) -> list[TimedAction] | RemoteActionChunk:
         """Predict an action chunk based on an observation.
 
         Pipeline:
@@ -356,7 +431,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, observation_t.rtc)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
@@ -367,6 +442,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
         # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
+        original_action_tensor = action_tensor.squeeze(0).detach().cpu()
         _, chunk_size, _ = action_tensor.shape
 
         # Process each action in the chunk
@@ -382,6 +458,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+
+        if observation_t.rtc is not None:
+            return RemoteActionChunk(
+                request_id=observation_t.rtc.request_id,
+                original_actions=original_action_tensor,
+                processed_actions=action_tensor,
+                observation_timestamp=observation_t.get_timestamp(),
+                observation_timestep=observation_t.get_timestep(),
+                action_count_before_inference=observation_t.rtc.action_count_before_inference,
+                starvation_count_before_inference=observation_t.rtc.starvation_count_before_inference,
+                inference_time_s=inference_time,
+            )
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(

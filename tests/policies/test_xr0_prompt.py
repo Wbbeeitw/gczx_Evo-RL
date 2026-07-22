@@ -122,3 +122,54 @@ def test_right_tactile_prompt_uses_native_xr0_format():
         "Use the right gripper to pick up the yellow plastic bottle on the right "
         "and place it on the blue towel on the left /no_cot",
     ]
+
+
+def test_xr0_rtc_prefix_is_normalized_and_restored_exactly():
+    policy = make_prompt_policy()
+    policy.config.max_action_dim = 32
+    policy.config.actions_are_delta = False
+    policy.register_buffer("_xr0_action_mean", torch.zeros(30, 32))
+    policy.register_buffer("_xr0_action_std", torch.ones(30, 32))
+    policy.register_buffer("_xr0_action_stats_loaded", torch.tensor(1, dtype=torch.uint8))
+    state = torch.full((1, 1, 32), 2.0)
+    previous_absolute_actions = torch.full((30, 32), 3.0)
+    native_batch = {
+        "state": state,
+        "action": torch.zeros(1, 30, 32),
+    }
+
+    prefix_length = policy._apply_rtc_prefix(
+        native_batch,
+        previous_absolute_actions,
+        execution_horizon=5,
+    )
+
+    assert prefix_length == 5
+    assert native_batch["prefix_length"] == 5
+    assert torch.allclose(native_batch["action"][:, :5], torch.ones(1, 5, 32))
+
+    restored = policy._restore_absolute_action(
+        policy._unnormalize_native_action(native_batch["action"]),
+        state,
+    )
+    assert torch.allclose(restored[:, :5], previous_absolute_actions[:5].unsqueeze(0))
+
+
+def test_xr0_rtc_prefix_rejects_wrong_action_dimension():
+    policy = make_prompt_policy()
+    policy.config.max_action_dim = 32
+    policy.config.actions_are_delta = False
+    policy.register_buffer("_xr0_action_mean", torch.zeros(30, 32))
+    policy.register_buffer("_xr0_action_std", torch.ones(30, 32))
+    policy.register_buffer("_xr0_action_stats_loaded", torch.tensor(1, dtype=torch.uint8))
+    native_batch = {
+        "state": torch.zeros(1, 1, 32),
+        "action": torch.zeros(1, 30, 32),
+    }
+
+    with pytest.raises(ValueError, match="action dimension"):
+        policy._apply_rtc_prefix(
+            native_batch,
+            torch.zeros(30, 14),
+            execution_horizon=5,
+        )

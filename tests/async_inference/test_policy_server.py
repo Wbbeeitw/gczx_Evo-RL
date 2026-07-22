@@ -217,3 +217,29 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_get_action_chunk_forwards_rtc_metadata(policy_server):
+    from lerobot.async_inference.helpers import RTCInferenceMetadata
+
+    captured_kwargs = {}
+
+    def predict_action_chunk(observation, **kwargs):
+        captured_kwargs.update(kwargs)
+        return torch.zeros(1, 20, 6)
+
+    policy_server.policy.predict_action_chunk = predict_action_chunk
+    prefix = torch.ones(20, 6)
+    rtc = RTCInferenceMetadata(
+        request_id=3,
+        prev_chunk_left_over=prefix,
+        inference_delay=2,
+        execution_horizon=5,
+    )
+
+    chunk = policy_server._get_action_chunk({OBS_STATE: torch.zeros(1, 6)}, rtc)
+
+    assert chunk.shape == (1, 20, 6)
+    assert torch.equal(captured_kwargs["prev_chunk_left_over"], prefix)
+    assert captured_kwargs["inference_delay"] == 2
+    assert captured_kwargs["execution_horizon"] == 5

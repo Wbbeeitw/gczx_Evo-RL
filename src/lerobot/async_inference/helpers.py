@@ -20,10 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import torch
 
 from lerobot.configs.types import PolicyFeature
 from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
 # NOTE: Configs need to be loaded for the client to be able to instantiate the policy config
 from lerobot.policies import (  # noqa: F401
@@ -48,6 +51,118 @@ LeRobotObservation = dict[str, torch.Tensor]
 
 # observation, ready for policy inference (image keys resized)
 Observation = dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class EncodedImage:
+    data: bytes
+    shape: tuple[int, int, int]
+    dtype: str
+    codec: str = "jpeg"
+
+
+@dataclass(frozen=True)
+class ImageCodecStats:
+    image_count: int = 0
+    raw_bytes: int = 0
+    encoded_bytes: int = 0
+    elapsed_s: float = 0.0
+
+
+def encode_observation_images(
+    observation: RawObservation,
+    codec: str = "raw",
+    jpeg_quality: int = 90,
+) -> tuple[RawObservation, ImageCodecStats]:
+    codec = codec.lower()
+    if codec == "raw":
+        return observation, ImageCodecStats()
+    if codec != "jpeg":
+        raise ValueError(f"Unsupported observation image codec: {codec}")
+    if jpeg_quality < 1 or jpeg_quality > 100:
+        raise ValueError(f"jpeg_quality must be between 1 and 100, got {jpeg_quality}")
+
+    started_at = time.perf_counter()
+    encoded_observation = observation.copy()
+    image_count = 0
+    raw_bytes = 0
+    encoded_bytes = 0
+
+    for key, value in observation.items():
+        if not (
+            isinstance(value, np.ndarray)
+            and value.dtype == np.uint8
+            and value.ndim == 3
+            and value.shape[-1] == 3
+        ):
+            continue
+
+        image = np.ascontiguousarray(value)
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+        )
+        if not success:
+            raise RuntimeError(f"Failed to JPEG-encode observation image '{key}'")
+
+        image_bytes = encoded.tobytes()
+        encoded_observation[key] = EncodedImage(
+            data=image_bytes,
+            shape=tuple(image.shape),
+            dtype=str(image.dtype),
+        )
+        image_count += 1
+        raw_bytes += image.nbytes
+        encoded_bytes += len(image_bytes)
+
+    return encoded_observation, ImageCodecStats(
+        image_count=image_count,
+        raw_bytes=raw_bytes,
+        encoded_bytes=encoded_bytes,
+        elapsed_s=time.perf_counter() - started_at,
+    )
+
+
+def decode_observation_images(
+    observation: RawObservation,
+) -> tuple[RawObservation, ImageCodecStats]:
+    started_at = time.perf_counter()
+    decoded_observation = observation.copy()
+    image_count = 0
+    raw_bytes = 0
+    encoded_bytes = 0
+
+    for key, value in observation.items():
+        if not isinstance(value, EncodedImage):
+            continue
+        if value.codec != "jpeg":
+            raise ValueError(f"Unsupported encoded image codec: {value.codec}")
+
+        encoded = np.frombuffer(value.data, dtype=np.uint8)
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Failed to JPEG-decode observation image '{key}'")
+        if tuple(image.shape) != value.shape:
+            raise ValueError(
+                f"Decoded observation image '{key}' has shape {tuple(image.shape)}, expected {value.shape}"
+            )
+        if str(image.dtype) != value.dtype:
+            raise ValueError(
+                f"Decoded observation image '{key}' has dtype {image.dtype}, expected {value.dtype}"
+            )
+
+        decoded_observation[key] = image
+        image_count += 1
+        raw_bytes += image.nbytes
+        encoded_bytes += len(value.data)
+
+    return decoded_observation, ImageCodecStats(
+        image_count=image_count,
+        raw_bytes=raw_bytes,
+        encoded_bytes=encoded_bytes,
+        elapsed_s=time.perf_counter() - started_at,
+    )
 
 
 def visualize_action_queue_size(action_queue_size: list[int]) -> None:
@@ -226,12 +341,35 @@ class TimedAction(TimedData):
 
 
 @dataclass
+class RTCInferenceMetadata:
+    request_id: int
+    prev_chunk_left_over: Action | None = None
+    inference_delay: int = 0
+    execution_horizon: int = 0
+    action_count_before_inference: int = 0
+    starvation_count_before_inference: int = 0
+
+
+@dataclass
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    rtc: RTCInferenceMetadata | None = None
 
     def get_observation(self):
         return self.observation
+
+
+@dataclass
+class RemoteActionChunk:
+    request_id: int
+    original_actions: Action
+    processed_actions: Action
+    observation_timestamp: float
+    observation_timestep: int
+    action_count_before_inference: int
+    starvation_count_before_inference: int
+    inference_time_s: float = 0.0
 
 
 @dataclass
@@ -270,6 +408,7 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    rtc_config: RTCConfig | None = None
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:
