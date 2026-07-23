@@ -56,6 +56,37 @@ from lerobot.utils.utils import (
 )
 
 
+def _make_pretrained_processor_overrides(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    device: torch.device,
+    dataset_stats: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    preprocessor_overrides = {
+        "device_processor": {"device": device.type},
+        "rename_observations_processor": {"rename_map": cfg.rename_map},
+    }
+
+    # XR0 checkpoints persist normalization in xr0_pack_action_layout and in
+    # the policy's action-stat buffers, rather than generic normalize steps.
+    if cfg.resume and cfg.policy.type == "xr0":
+        return preprocessor_overrides, {}
+
+    preprocessor_overrides["normalizer_processor"] = {
+        "stats": dataset_stats,
+        "features": {**policy.config.input_features, **policy.config.output_features},
+        "norm_map": policy.config.normalization_mapping,
+    }
+    postprocessor_overrides = {
+        "unnormalizer_processor": {
+            "stats": dataset_stats,
+            "features": policy.config.output_features,
+            "norm_map": policy.config.normalization_mapping,
+        }
+    }
+    return preprocessor_overrides, postprocessor_overrides
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -291,24 +322,14 @@ def train(
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
-        processor_kwargs["preprocessor_overrides"] = {
-            "device_processor": {"device": device.type},
-            "normalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": {**policy.config.input_features, **policy.config.output_features},
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
-        processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
-            "rename_map": cfg.rename_map
-        }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
+        preprocessor_overrides, postprocessor_overrides = _make_pretrained_processor_overrides(
+            cfg,
+            policy,
+            device,
+            dataset.meta.stats,
+        )
+        processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
+        postprocessor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
