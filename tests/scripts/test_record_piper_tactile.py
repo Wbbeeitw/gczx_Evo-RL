@@ -9,7 +9,9 @@ from lerobot.scripts.lerobot_record_piper_tactile import (
     _disconnect_hardware,
     _episode_metadata,
     _FrameWriter,
+    _log_live_frame,
     _missing_left_wrist_frame,
+    parse_args,
 )
 
 
@@ -212,3 +214,72 @@ def test_missing_left_wrist_copies_configured_source(
 
     np.testing.assert_array_equal(frame, source)
     assert frame is not source
+
+
+def test_live_display_receives_rgb_and_tactile_observations() -> None:
+    captured = {}
+
+    def display_logger(**kwargs) -> None:
+        captured.update(kwargs)
+
+    observation = {
+        "left_ego": np.zeros((4, 6, 3), dtype=np.uint8),
+        "left_wrist": np.zeros((4, 6, 3), dtype=np.uint8),
+        "right_wrist": np.zeros((4, 6, 3), dtype=np.uint8),
+        "right_tactile": np.zeros((8, 8, 3), dtype=np.uint8),
+    }
+    action = {"right_joint_1.pos": 1.0}
+
+    _log_live_frame(
+        display_logger,
+        observation,
+        action,
+        compress_images=True,
+    )
+
+    assert captured == {
+        "observation": observation,
+        "action": action,
+        "compress_images": True,
+    }
+
+
+def test_live_display_is_a_noop_when_disabled() -> None:
+    _log_live_frame(
+        None,
+        {"right_tactile": np.zeros((8, 8, 3), dtype=np.uint8)},
+        {},
+        compress_images=True,
+    )
+
+
+def test_display_cli_flags(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "lerobot-record-piper-tactile",
+            "--task",
+            "test task",
+            "--left-follower-can",
+            "can0",
+            "--right-follower-can",
+            "can1",
+            "--left-leader-can",
+            "can2",
+            "--right-leader-can",
+            "can3",
+            "--top-camera",
+            "top",
+            "--right-wrist-camera",
+            "right-wrist",
+            "--dataset.repo_id",
+            "test/repo",
+            "--display_data",
+            "--no-display-compressed-images",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.display_data is True
+    assert args.display_compressed_images is False

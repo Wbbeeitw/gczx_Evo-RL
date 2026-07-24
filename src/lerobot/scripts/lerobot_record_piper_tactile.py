@@ -69,6 +69,26 @@ _FRAME_QUEUE_SENTINEL = object()
 _SAVED_OUTCOMES = frozenset({"success", "failure", "ongoing"})
 
 
+def _start_live_display(enabled: bool):
+    if not enabled:
+        return None
+
+    from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+    init_rerun(session_name="piper_tactile_recording")
+    return log_rerun_data
+
+
+def _log_live_frame(display_logger, observation, action, *, compress_images: bool) -> None:
+    if display_logger is None:
+        return
+    display_logger(
+        observation=observation,
+        action=action,
+        compress_images=compress_images,
+    )
+
+
 class _FrameWriter:
     """Write dataset frames in order and surface worker failures to the caller."""
 
@@ -313,6 +333,20 @@ def parse_args() -> argparse.Namespace:
                         help="Max seconds per episode. 0 = unlimited.")
     parser.add_argument("--default-trajectory-type", choices=("success", "failure", "ongoing"),
                         default="success")
+    parser.add_argument(
+        "--display-data",
+        "--display_data",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Display all RGB cameras, tactile heatmaps, states, and actions in Rerun.",
+    )
+    parser.add_argument(
+        "--display-compressed-images",
+        "--display_compressed_images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="JPEG-compress images sent to Rerun to reduce viewer bandwidth and memory usage.",
+    )
     # Dataset
     parser.add_argument("--dataset.repo_id", type=str, required=True, dest="dataset_repo_id",
                         help="HuggingFace-style dataset name, e.g. my_org/my_dataset")
@@ -364,6 +398,12 @@ def main():
     init_logging()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     logger = logging.getLogger("piper-tactile-record")
+    display_logger = _start_live_display(args.display_data)
+    if display_logger is not None:
+        logger.info(
+            "Rerun live display enabled compressed_images=%s",
+            args.display_compressed_images,
+        )
 
     # ---- Build robot config --------------------------------------------------
     left_cams = {}
@@ -594,6 +634,7 @@ def main():
                             obs = robot.get_observation()
                             action = teleop.get_action()
                             robot.send_action(action)
+                            display_observation = dict(obs) if display_logger is not None else None
 
                             # Build frame (fast path)
                             state_vals = np.array([float(obs[k]) for k in state_keys], dtype=np.float32)
@@ -615,7 +656,15 @@ def main():
                                 else:
                                     image = obs[camera_key]
                                 frame_data[f"observation.images.{camera_key}"] = image
+                                if display_observation is not None:
+                                    display_observation[camera_key] = image
                             frame_writer.submit(frame_data)
+                            _log_live_frame(
+                                display_logger,
+                                display_observation,
+                                action,
+                                compress_images=args.display_compressed_images,
+                            )
                             frame_count += 1
 
                             elapsed = time.perf_counter() - start_t
