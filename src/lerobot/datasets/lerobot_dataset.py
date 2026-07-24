@@ -1529,16 +1529,21 @@ class LeRobotDataset(torch.utils.data.Dataset):
         }
         return metadata
 
-    def clear_episode_buffer(self, delete_images: bool = True) -> None:
-        # Clean up image files for the current episode buffer
+    def clear_episode_buffer(self, delete_images: bool = True, delete_videos: bool = False) -> None:
+        # Clean up camera frame files for the current episode buffer
+        camera_keys = []
         if delete_images:
+            camera_keys.extend(self.meta.image_keys)
+        if delete_videos:
+            camera_keys.extend(self.meta.video_keys)
+        if camera_keys:
             # Wait for the async image writer to finish
             if self.image_writer is not None:
                 self._wait_image_writer()
             episode_index = self.episode_buffer["episode_index"]
             if isinstance(episode_index, np.ndarray):
                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            for cam_key in self.meta.image_keys:
+            for cam_key in camera_keys:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)

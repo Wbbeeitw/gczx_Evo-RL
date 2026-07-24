@@ -582,7 +582,6 @@ def main():
 
     # ---- Episode loop --------------------------------------------------------
     saved_count = 0
-    episode_index = 1
     try:
         robot.connect()
         try:
@@ -608,6 +607,7 @@ def main():
 
         with VideoEncodingManager(dataset), _disconnect_on_error(robot, teleop, logger):
             while True:
+                episode_index = dataset.meta.total_episodes
                 input(f"\nPress ENTER to start episode {episode_index:03d} ...")
 
                 # Episode is started implicitly by the first add_frame()
@@ -713,10 +713,9 @@ def main():
 
                 if frame_count == 0:
                     logger.warning("  No frames — discarding empty episode.")
-                    dataset.clear_episode_buffer()
+                    dataset.clear_episode_buffer(delete_videos=True)
                     if quit_session:
                         break
-                    episode_index += 1
                     continue
 
                 # Resolve outcome
@@ -724,25 +723,23 @@ def main():
                     pass  # already set
                 elif outcome == "discard":
                     logger.info("  Episode discarded.")
-                    dataset.clear_episode_buffer()
+                    dataset.clear_episode_buffer(delete_videos=True)
                     if quit_session:
                         break
-                    episode_index += 1
                     continue
                 elif outcome == "quit":
                     logger.info("  Quit — discarding current episode.")
-                    dataset.clear_episode_buffer()
+                    dataset.clear_episode_buffer(delete_videos=True)
                     break
                 else:
                     outcome = prompt_outcome(args.default_trajectory_type)
                     if outcome == "discard":
                         logger.info("  Episode discarded.")
-                        dataset.clear_episode_buffer()
-                        episode_index += 1
+                        dataset.clear_episode_buffer(delete_videos=True)
                         continue
                     if outcome == "quit":
                         logger.info("  Quit — discarding current episode.")
-                        dataset.clear_episode_buffer()
+                        dataset.clear_episode_buffer(delete_videos=True)
                         break
 
                 # Save
@@ -758,7 +755,6 @@ def main():
 
                 if quit_session:
                     break
-                episode_index += 1
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")

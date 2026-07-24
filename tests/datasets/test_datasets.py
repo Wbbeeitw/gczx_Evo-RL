@@ -375,6 +375,36 @@ def test_tmp_video_deletion(tmp_path, empty_lerobot_dataset_factory):
     )
 
 
+def test_discarded_video_frames_are_removed_before_rerecording(tmp_path, empty_lerobot_dataset_factory):
+    video_key = "video"
+    features = {
+        video_key: {"dtype": "video", "shape": DUMMY_CHW, "names": ["channels", "height", "width"]}
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "discarded_video", features=features, batch_encoding_size=2
+    )
+
+    for _ in range(5):
+        dataset.add_frame({video_key: np.random.rand(*DUMMY_CHW), "task": "Dummy task"})
+    dataset._wait_image_writer()
+
+    video_dir = dataset._get_image_file_dir(0, video_key)
+    assert len(list(video_dir.iterdir())) == 5
+
+    dataset.clear_episode_buffer(delete_videos=True)
+
+    assert not video_dir.exists()
+    assert dataset.episode_buffer["episode_index"] == 0
+    assert dataset.episode_buffer["size"] == 0
+
+    for _ in range(2):
+        dataset.add_frame({video_key: np.random.rand(*DUMMY_CHW), "task": "Dummy task"})
+    dataset._wait_image_writer()
+
+    assert len(list(video_dir.iterdir())) == 2
+    dataset.clear_episode_buffer(delete_videos=True)
+
+
 def test_tmp_mixed_deletion(tmp_path, empty_lerobot_dataset_factory):
     """Verify temporary image directories are removed appropriately when both image and video features are present."""
     image_key = "image"
