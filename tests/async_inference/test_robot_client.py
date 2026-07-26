@@ -258,6 +258,83 @@ def test_rtc_dry_run_does_not_send_robot_action(monkeypatch, robot_client):
     assert robot_client.rtc_action_queue.get_action_count() == 1
 
 
+@pytest.mark.parametrize("rtc_enabled", [False, True])
+def test_right_arm_filter_suppresses_left_actions_for_all_queue_modes(
+    monkeypatch, robot_client, rtc_enabled: bool
+):
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    action_features = {
+        "left_joint_1.pos": float,
+        "left_gripper.pos": float,
+        "right_joint_1.pos": float,
+        "right_gripper.pos": float,
+    }
+    robot_client.robot.action_features = action_features
+    robot_client.config.controlled_arms = "right"
+    action_tensor = torch.tensor([10.0, 20.0, 30.0, 40.0])
+    sent_actions = []
+
+    def record_action(action):
+        sent_actions.append(action)
+        return action
+
+    monkeypatch.setattr(robot_client.robot, "send_action", record_action)
+
+    if rtc_enabled:
+        robot_client.config.rtc = RTCConfig(enabled=True, execution_horizon=1)
+        robot_client.rtc_action_queue = ActionQueue(robot_client.config.rtc)
+        actions = action_tensor.unsqueeze(0)
+        assert robot_client.rtc_action_queue.merge(actions, actions, real_delay=0)
+    else:
+        robot_client.rtc_action_queue = None
+        robot_client.action_queue.put(
+            TimedAction(action=action_tensor, timestep=0, timestamp=time.time())
+        )
+
+    performed_action = robot_client.control_loop_action()
+
+    expected = {"right_joint_1.pos": 30.0, "right_gripper.pos": 40.0}
+    assert sent_actions == [expected]
+    assert performed_action == expected
+
+
+@pytest.mark.parametrize(
+    "controlled_arms, expected",
+    [
+        ("both", {"left_joint.pos": 1.0, "right_joint.pos": 2.0}),
+        ("left", {"left_joint.pos": 1.0}),
+        ("right", {"right_joint.pos": 2.0}),
+    ],
+)
+def test_action_arm_filter_mapping(robot_client, controlled_arms: str, expected: dict[str, float]):
+    robot_client.robot.action_features = {
+        "left_joint.pos": float,
+        "right_joint.pos": float,
+    }
+    robot_client.config.controlled_arms = controlled_arms
+
+    action = robot_client._action_tensor_to_action_dict(torch.tensor([1.0, 2.0]))
+
+    assert action == expected
+
+
+def test_robot_client_config_rejects_invalid_controlled_arms():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match="controlled_arms"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            controlled_arms="invalid",
+        )
+
+
 def test_rtc_metadata_contains_padded_leftover_actions(robot_client):
     from lerobot.policies.rtc.action_queue import ActionQueue
     from lerobot.policies.rtc.configuration_rtc import RTCConfig

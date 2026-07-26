@@ -137,6 +137,10 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    controlled_arms: str = field(
+        default="both",
+        metadata={"help": "Robot arms allowed to receive actions: both, left, or right"},
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -198,6 +202,12 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.controlled_arms not in {"both", "left", "right"}:
+            raise ValueError(
+                "controlled_arms must be one of ['both', 'left', 'right'], "
+                f"got {self.controlled_arms}"
+            )
+
         if self.duration < 0:
             raise ValueError(f"duration must be non-negative, got {self.duration}")
 
@@ -230,6 +240,7 @@ class RobotClientConfig:
             "policy_device": self.policy_device,
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
+            "controlled_arms": self.controlled_arms,
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,

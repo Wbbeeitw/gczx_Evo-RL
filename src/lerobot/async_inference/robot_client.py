@@ -104,6 +104,24 @@ class RobotClient:
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
 
+        if config.controlled_arms != "both":
+            suppressed_prefix = "left_" if config.controlled_arms == "right" else "right_"
+            suppressed_keys = [
+                key for key in self.robot.action_features if key.startswith(suppressed_prefix)
+            ]
+            if suppressed_keys:
+                self.logger.info(
+                    "Action arm filter enabled controlled_arms=%s suppressed_keys=%s",
+                    config.controlled_arms,
+                    suppressed_keys,
+                )
+            else:
+                self.logger.warning(
+                    "Action arm filter controlled_arms=%s found no %s-prefixed action keys",
+                    config.controlled_arms,
+                    suppressed_prefix.rstrip("_"),
+                )
+
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
         # Use environment variable if server_address is not provided in config
@@ -570,6 +588,10 @@ class RobotClient:
                 f"{len(self.robot.action_features)}"
             )
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
+        if self.config.controlled_arms == "right":
+            action = {key: value for key, value in action.items() if not key.startswith("left_")}
+        elif self.config.controlled_arms == "left":
+            action = {key: value for key, value in action.items() if not key.startswith("right_")}
         return action
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any] | None:
