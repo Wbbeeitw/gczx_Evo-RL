@@ -89,6 +89,16 @@ from .helpers import (
 )
 
 
+def _start_live_display(enabled: bool):
+    if not enabled:
+        return None
+
+    from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+    init_rerun(session_name="async_inference_robot_client")
+    return log_rerun_data
+
+
 class RobotClient:
     prefix = "robot_client"
     logger = get_logger(prefix)
@@ -101,6 +111,13 @@ class RobotClient:
         """
         # Store configuration
         self.config = config
+        try:
+            self.display_logger = _start_live_display(config.display_data)
+        except Exception:
+            self.logger.exception("Could not start Rerun live display; continuing without it.")
+            self.display_logger = None
+        self.display_action_lock = threading.Lock()
+        self.latest_display_action = None
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
 
@@ -175,6 +192,12 @@ class RobotClient:
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
 
         self.logger.info("Robot connected and ready")
+
+        if self.display_logger is not None:
+            self.logger.info(
+                "Rerun live display enabled compressed_images=%s",
+                self.config.display_compressed_images,
+            )
 
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
@@ -594,6 +617,35 @@ class RobotClient:
             action = {key: value for key, value in action.items() if not key.startswith("right_")}
         return action
 
+    def _remember_display_action(self, action: dict[str, Any] | None) -> None:
+        if action is None:
+            return
+        with self.display_action_lock:
+            self.latest_display_action = dict(action)
+
+    def _log_live_observation(self, observation: RawObservation) -> None:
+        if self.display_logger is None:
+            return
+
+        with self.display_action_lock:
+            action = None if self.latest_display_action is None else dict(self.latest_display_action)
+
+        try:
+            self.display_logger(
+                observation=observation,
+                action=action,
+                compress_images=self.config.display_compressed_images,
+            )
+        except Exception:
+            self.logger.exception("Rerun live display failed; disabling it for this client run.")
+            self.display_logger = None
+
+    def _capture_raw_observation(self, task: str) -> RawObservation:
+        raw_observation: RawObservation = self.robot.get_observation()
+        raw_observation["task"] = task
+        self._log_live_observation(raw_observation)
+        return raw_observation
+
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any] | None:
         """Reading and performing actions in local queue"""
 
@@ -620,6 +672,8 @@ class RobotClient:
             with self.latest_action_lock:
                 self.latest_action = self.rtc_action_queue.get_action_count() - 1
                 self.executed_action_count = self.rtc_action_queue.get_action_count()
+            display_action = performed_action if performed_action is not None else action_dict
+            self._remember_display_action(display_action)
             return performed_action
 
         get_start = time.perf_counter()
@@ -650,6 +704,8 @@ class RobotClient:
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
             self.executed_action_count += 1
+        display_action = performed_action if performed_action is not None else action_dict
+        self._remember_display_action(display_action)
 
         if verbose:
             with self.action_queue_lock:
@@ -697,8 +753,7 @@ class RobotClient:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
-            raw_observation: RawObservation = self.robot.get_observation()
-            raw_observation["task"] = task
+            raw_observation = self._capture_raw_observation(task)
             observation_timestamp = time.time()
 
             wire_observation, codec_stats = encode_observation_images(
@@ -877,6 +932,11 @@ class RobotClient:
                 captured_observation = self.control_loop_observation(task, verbose)
                 if captured_observation is not None:
                     self.latest_captured_observation = captured_observation
+            elif self.display_logger is not None:
+                try:
+                    self.latest_captured_observation = self._capture_raw_observation(task)
+                except Exception as error:
+                    self.logger.error("Error capturing live display observation: %s", error)
 
             self.logger.debug(
                 f"Observation loop (ms): {(time.perf_counter() - observation_loop_start) * 1000:.2f}"

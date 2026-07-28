@@ -165,6 +165,14 @@ class RobotClientConfig:
         default=90,
         metadata={"help": "JPEG quality used when observation_image_codec=jpeg"},
     )
+    display_data: bool = field(
+        default=False,
+        metadata={"help": "Display live robot observations and executed actions in Rerun"},
+    )
+    display_compressed_images: bool = field(
+        default=True,
+        metadata={"help": "JPEG-compress images sent to the local Rerun viewer"},
+    )
 
     # Debug configuration
     debug_visualize_queue_size: bool = field(
@@ -251,4 +259,6 @@ class RobotClientConfig:
             "duration": self.duration,
             "observation_image_codec": self.observation_image_codec,
             "observation_jpeg_quality": self.observation_jpeg_quality,
+            "display_data": self.display_data,
+            "display_compressed_images": self.display_compressed_images,
         }

@@ -23,6 +23,7 @@ import threading
 import time
 from queue import Queue
 
+import numpy as np
 import pytest
 import torch
 
@@ -299,6 +300,7 @@ def test_right_arm_filter_suppresses_left_actions_for_all_queue_modes(
     expected = {"right_joint_1.pos": 30.0, "right_gripper.pos": 40.0}
     assert sent_actions == [expected]
     assert performed_action == expected
+    assert robot_client.latest_display_action == expected
 
 
 @pytest.mark.parametrize(
@@ -319,6 +321,95 @@ def test_action_arm_filter_mapping(robot_client, controlled_arms: str, expected:
     action = robot_client._action_tensor_to_action_dict(torch.tensor([1.0, 2.0]))
 
     assert action == expected
+
+
+def test_live_display_logs_observation_and_latest_executed_action(robot_client):
+    calls = []
+    robot_client.config.display_compressed_images = True
+    robot_client.display_logger = lambda **kwargs: calls.append(kwargs)
+    robot_client._remember_display_action({"right_joint.pos": 1.25})
+    observation = {
+        "right_tactile": np.zeros((8, 8, 3), dtype=np.uint8),
+        "right_joint.pos": 0.5,
+    }
+
+    robot_client._log_live_observation(observation)
+
+    assert calls == [
+        {
+            "observation": observation,
+            "action": {"right_joint.pos": 1.25},
+            "compress_images": True,
+        }
+    ]
+
+
+def test_live_display_failure_disables_display_without_raising(robot_client):
+    def fail_display(**kwargs):
+        del kwargs
+        raise RuntimeError("viewer closed")
+
+    robot_client.display_logger = fail_display
+
+    robot_client._log_live_observation({"right_joint.pos": 0.5})
+
+    assert robot_client.display_logger is None
+
+
+def test_live_display_startup_failure_does_not_block_client(monkeypatch):
+    from lerobot.async_inference import robot_client as robot_client_module
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    def fail_startup(enabled):
+        del enabled
+        raise RuntimeError("viewer unavailable")
+
+    monkeypatch.setattr(robot_client_module, "_start_live_display", fail_startup)
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        display_data=True,
+    )
+
+    client = robot_client_module.RobotClient(config)
+    try:
+        assert client.display_logger is None
+        assert client.robot.is_connected
+    finally:
+        client.stop()
+
+
+def test_capture_raw_observation_adds_task_and_logs_display(monkeypatch, robot_client):
+    observation = {"right_tactile": np.zeros((8, 8, 3), dtype=np.uint8)}
+    displayed = []
+    monkeypatch.setattr(robot_client.robot, "get_observation", lambda: dict(observation))
+    monkeypatch.setattr(robot_client, "_log_live_observation", displayed.append)
+
+    captured = robot_client._capture_raw_observation("move the cup")
+
+    assert captured == {**observation, "task": "move the cup"}
+    assert displayed == [captured]
+
+
+def test_robot_client_config_exposes_live_display_settings():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        display_data=True,
+        display_compressed_images=False,
+    )
+
+    config_dict = config.to_dict()
+    assert config_dict["display_data"] is True
+    assert config_dict["display_compressed_images"] is False
 
 
 def test_robot_client_config_rejects_invalid_controlled_arms():
