@@ -44,6 +44,35 @@ def test_read_latest_returns_fresh_frame(monkeypatch) -> None:
     assert camera.read_latest(max_age_ms=500) is frame
 
 
+def test_connected_camera_can_be_recalibrated() -> None:
+    camera = _connected_camera()
+    expected_offsets = {"index_middle": np.array([0.1, 0.2, 0.3], dtype=np.float32)}
+    calls = []
+
+    def calibrate(**kwargs):
+        calls.append(kwargs)
+        return expected_offsets
+
+    camera._runtime.calibrate = calibrate
+
+    offsets = camera.calibrate(
+        sample_count=10,
+        sample_interval=0.01,
+        warmup_frames=5,
+        reducer="median",
+    )
+
+    assert offsets is expected_offsets
+    assert calls == [
+        {
+            "sample_count": 10,
+            "sample_interval": 0.01,
+            "warmup_frames": 5,
+            "reducer": "median",
+        }
+    ]
+
+
 def test_read_latest_rejects_stale_frame(monkeypatch) -> None:
     camera = _connected_camera()
     camera._latest_frame = np.zeros((2, 2, 3), dtype=np.uint8)

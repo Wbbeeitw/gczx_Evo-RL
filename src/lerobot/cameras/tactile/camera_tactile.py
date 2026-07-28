@@ -179,6 +179,23 @@ class TactileCamera(Camera):
         return self.async_read()
 
     @check_if_not_connected
+    def calibrate(
+        self,
+        sample_count: int | None = None,
+        sample_interval: float | None = None,
+        warmup_frames: int | None = None,
+        reducer: str | None = None,
+    ) -> dict[str, NDArray[Any]]:
+        """Recompute tactile zero-point offsets while the camera is connected."""
+        assert self._runtime is not None
+        return self._runtime.calibrate(
+            sample_count=sample_count,
+            sample_interval=sample_interval,
+            warmup_frames=warmup_frames,
+            reducer=reducer,
+        )
+
+    @check_if_not_connected
     def async_read(self, timeout_ms: float = 1000) -> NDArray[Any]:
         """Return a recent rendered frame, waiting for an update when the cache is stale."""
         if self._read_thread is None or not self._read_thread.is_alive():

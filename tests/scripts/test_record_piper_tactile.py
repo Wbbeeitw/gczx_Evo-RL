@@ -11,6 +11,7 @@ from lerobot.scripts.lerobot_record_piper_tactile import (
     _FrameWriter,
     _log_live_frame,
     _missing_left_wrist_frame,
+    _recalibrate_tactile_cameras,
     parse_args,
 )
 
@@ -175,6 +176,43 @@ def test_episode_metadata_rejects_unsaved_outcomes() -> None:
         _episode_metadata("discard")
 
 
+def test_recalibrate_tactile_cameras_calibrates_each_arm() -> None:
+    class FakeTactileCamera:
+        def __init__(self, side: str) -> None:
+            self.side = side
+            self.calibrate_calls = 0
+
+        def calibrate(self) -> None:
+            self.calibrate_calls += 1
+
+    left_tactile = FakeTactileCamera("left")
+    right_tactile = FakeTactileCamera("right")
+    robot = SimpleNamespace(
+        left_arm=SimpleNamespace(cameras={"wrist": object(), "tactile": left_tactile}),
+        right_arm=SimpleNamespace(cameras={"tactile": right_tactile}),
+    )
+
+    _recalibrate_tactile_cameras(robot, logging.getLogger(__name__))
+
+    assert left_tactile.calibrate_calls == 1
+    assert right_tactile.calibrate_calls == 1
+
+
+def test_recalibrate_tactile_cameras_propagates_failure() -> None:
+    class FailingTactileCamera:
+        @staticmethod
+        def calibrate() -> None:
+            raise RuntimeError("sensor must be unloaded")
+
+    robot = SimpleNamespace(
+        left_arm=SimpleNamespace(cameras={}),
+        right_arm=SimpleNamespace(cameras={"tactile": FailingTactileCamera()}),
+    )
+
+    with pytest.raises(RuntimeError, match="sensor must be unloaded"):
+        _recalibrate_tactile_cameras(robot, logging.getLogger(__name__))
+
+
 def test_missing_left_wrist_black_fill() -> None:
     frame = _missing_left_wrist_frame(
         {},
@@ -283,3 +321,34 @@ def test_display_cli_flags(monkeypatch) -> None:
 
     assert args.display_data is True
     assert args.display_compressed_images is False
+    assert args.tactile_calibrate_after_episode is True
+
+
+def test_tactile_recalibration_cli_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "lerobot-record-piper-tactile",
+            "--task",
+            "test task",
+            "--left-follower-can",
+            "can0",
+            "--right-follower-can",
+            "can1",
+            "--left-leader-can",
+            "can2",
+            "--right-leader-can",
+            "can3",
+            "--top-camera",
+            "top",
+            "--right-wrist-camera",
+            "right-wrist",
+            "--dataset.repo_id",
+            "test/repo",
+            "--no-tactile-calibrate-after-episode",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.tactile_calibrate_after_episode is False

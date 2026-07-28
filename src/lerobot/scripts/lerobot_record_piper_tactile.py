@@ -167,6 +167,25 @@ def _episode_metadata(outcome: str) -> dict[str, str]:
     return {"trajectory_type": outcome}
 
 
+def _recalibrate_tactile_cameras(robot, logger: logging.Logger) -> None:
+    tactile_cameras = []
+    for side in ("left", "right"):
+        arm = getattr(robot, f"{side}_arm", None)
+        cameras = getattr(arm, "cameras", {})
+        camera = cameras.get("tactile")
+        if camera is not None:
+            tactile_cameras.append((side, camera))
+
+    if not tactile_cameras:
+        return
+
+    logger.info("  Recalibrating tactile sensors; keep both fingertips unloaded and still.")
+    for side, camera in tactile_cameras:
+        logger.info("  Recalibrating %s tactile sensor...", side)
+        camera.calibrate()
+    logger.info("  Tactile recalibration complete. The next episode can now be started.")
+
+
 def _missing_left_wrist_frame(
     observation: dict[str, object],
     *,
@@ -317,6 +336,15 @@ def parse_args() -> argparse.Namespace:
         "--tactile-calibrate-on-connect",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--tactile-calibrate-after-episode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Recalibrate connected tactile sensors after every saved episode, before prompting "
+            "to start the next episode. Keep the fingertips unloaded while calibration runs."
+        ),
     )
     # Piper params
     parser.add_argument("--follower-startup-sleep-s", type=float, default=0.5)
@@ -752,6 +780,9 @@ def main():
                     "  Saved episode %03d as '%s' (%d frames).",
                     episode_index, outcome, frame_count,
                 )
+
+                if args.tactile_calibrate_after_episode:
+                    _recalibrate_tactile_cameras(robot, logger)
 
                 if quit_session:
                     break
