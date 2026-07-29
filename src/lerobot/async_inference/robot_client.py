@@ -118,6 +118,17 @@ class RobotClient:
             self.display_logger = None
         self.display_action_lock = threading.Lock()
         self.latest_display_action = None
+        self.gripper_diagnostics_lock = threading.Lock()
+        self.latest_right_gripper_target = None
+        self.latest_right_gripper_sent = None
+        self.latest_right_gripper_feedback = None
+        self.latest_right_gripper_feedback_at = None
+        self.right_gripper_target_min = None
+        self.right_gripper_target_max = None
+        self.right_gripper_sent_min = None
+        self.right_gripper_sent_max = None
+        self.right_gripper_feedback_min = None
+        self.right_gripper_feedback_max = None
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
 
@@ -623,6 +634,104 @@ class RobotClient:
         with self.display_action_lock:
             self.latest_display_action = dict(action)
 
+    def _remember_gripper_action(
+        self,
+        target_action: dict[str, Any],
+        sent_action: dict[str, Any] | None,
+    ) -> None:
+        target = target_action.get("right_gripper.pos")
+        sent = None if sent_action is None else sent_action.get("right_gripper.pos")
+        if sent is None:
+            sent = target
+        with self.gripper_diagnostics_lock:
+            self.latest_right_gripper_target = None if target is None else float(target)
+            self.latest_right_gripper_sent = None if sent is None else float(sent)
+            if target is not None:
+                target = float(target)
+                self.right_gripper_target_min = (
+                    target
+                    if self.right_gripper_target_min is None
+                    else min(self.right_gripper_target_min, target)
+                )
+                self.right_gripper_target_max = (
+                    target
+                    if self.right_gripper_target_max is None
+                    else max(self.right_gripper_target_max, target)
+                )
+            if sent is not None:
+                sent = float(sent)
+                self.right_gripper_sent_min = (
+                    sent
+                    if self.right_gripper_sent_min is None
+                    else min(self.right_gripper_sent_min, sent)
+                )
+                self.right_gripper_sent_max = (
+                    sent
+                    if self.right_gripper_sent_max is None
+                    else max(self.right_gripper_sent_max, sent)
+                )
+
+    def _remember_gripper_feedback(self, observation: RawObservation) -> None:
+        feedback = observation.get("right_gripper.pos")
+        if feedback is None:
+            return
+        with self.gripper_diagnostics_lock:
+            feedback = float(feedback)
+            self.latest_right_gripper_feedback = feedback
+            self.latest_right_gripper_feedback_at = time.perf_counter()
+            self.right_gripper_feedback_min = (
+                feedback
+                if self.right_gripper_feedback_min is None
+                else min(self.right_gripper_feedback_min, feedback)
+            )
+            self.right_gripper_feedback_max = (
+                feedback
+                if self.right_gripper_feedback_max is None
+                else max(self.right_gripper_feedback_max, feedback)
+            )
+
+    def _get_gripper_diagnostics(
+        self, now: float | None = None, reset_window: bool = False
+    ) -> dict[str, float]:
+        with self.gripper_diagnostics_lock:
+            target = self.latest_right_gripper_target
+            sent = self.latest_right_gripper_sent
+            feedback = self.latest_right_gripper_feedback
+            feedback_at = self.latest_right_gripper_feedback_at
+            target_min = self.right_gripper_target_min
+            target_max = self.right_gripper_target_max
+            sent_min = self.right_gripper_sent_min
+            sent_max = self.right_gripper_sent_max
+            feedback_min = self.right_gripper_feedback_min
+            feedback_max = self.right_gripper_feedback_max
+            if reset_window:
+                self.right_gripper_target_min = None
+                self.right_gripper_target_max = None
+                self.right_gripper_sent_min = None
+                self.right_gripper_sent_max = None
+                self.right_gripper_feedback_min = None
+                self.right_gripper_feedback_max = None
+
+        nan = float("nan")
+        feedback_age_ms = (
+            nan
+            if feedback_at is None
+            else max(0.0, (time.perf_counter() if now is None else now) - feedback_at) * 1000.0
+        )
+        return {
+            "target": nan if target is None else target,
+            "sent": nan if sent is None else sent,
+            "feedback": nan if feedback is None else feedback,
+            "error": nan if feedback is None or sent is None else feedback - sent,
+            "feedback_age_ms": feedback_age_ms,
+            "target_min": nan if target_min is None else target_min,
+            "target_max": nan if target_max is None else target_max,
+            "sent_min": nan if sent_min is None else sent_min,
+            "sent_max": nan if sent_max is None else sent_max,
+            "feedback_min": nan if feedback_min is None else feedback_min,
+            "feedback_max": nan if feedback_max is None else feedback_max,
+        }
+
     def _log_live_observation(self, observation: RawObservation) -> None:
         if self.display_logger is None:
             return
@@ -642,6 +751,7 @@ class RobotClient:
 
     def _capture_raw_observation(self, task: str) -> RawObservation:
         raw_observation: RawObservation = self.robot.get_observation()
+        self._remember_gripper_feedback(raw_observation)
         raw_observation["task"] = task
         self._log_live_observation(raw_observation)
         return raw_observation
@@ -673,6 +783,7 @@ class RobotClient:
                 self.latest_action = self.rtc_action_queue.get_action_count() - 1
                 self.executed_action_count = self.rtc_action_queue.get_action_count()
             display_action = performed_action if performed_action is not None else action_dict
+            self._remember_gripper_action(action_dict, performed_action)
             self._remember_display_action(display_action)
             return performed_action
 
@@ -705,6 +816,7 @@ class RobotClient:
             self.latest_action = timed_action.get_timestep()
             self.executed_action_count += 1
         display_action = performed_action if performed_action is not None else action_dict
+        self._remember_gripper_action(action_dict, performed_action)
         self._remember_display_action(display_action)
 
         if verbose:
@@ -896,9 +1008,15 @@ class RobotClient:
                         if self.rtc_action_queue is not None
                         else self.action_queue.qsize()
                     )
+                    gripper = self._get_gripper_diagnostics(reset_window=True)
                     self.logger.info(
                         "Action #%d queue=%d send=%.1fms max_send=%.1fms "
-                        "effective_hz=%.2f missed_deadlines=%d max_lag=%.1fms dry_run=%s",
+                        "effective_hz=%.2f missed_deadlines=%d max_lag=%.1fms dry_run=%s "
+                        "right_gripper_target=%.2f right_gripper_sent=%.2f "
+                        "right_gripper_feedback=%.2f right_gripper_error=%.2f feedback_age_ms=%.1f "
+                        "right_gripper_target_range=[%.2f,%.2f] "
+                        "right_gripper_sent_range=[%.2f,%.2f] "
+                        "right_gripper_feedback_range=[%.2f,%.2f]",
                         action_count_after,
                         queue_size,
                         self.last_action_send_duration_s * 1000.0,
@@ -907,6 +1025,17 @@ class RobotClient:
                         missed_deadlines,
                         max_deadline_lag_s * 1000.0,
                         self.config.dry_run_actions,
+                        gripper["target"],
+                        gripper["sent"],
+                        gripper["feedback"],
+                        gripper["error"],
+                        gripper["feedback_age_ms"],
+                        gripper["target_min"],
+                        gripper["target_max"],
+                        gripper["sent_min"],
+                        gripper["sent_max"],
+                        gripper["feedback_min"],
+                        gripper["feedback_max"],
                     )
 
             self.logger.debug(

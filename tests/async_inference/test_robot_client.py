@@ -301,6 +301,9 @@ def test_right_arm_filter_suppresses_left_actions_for_all_queue_modes(
     assert sent_actions == [expected]
     assert performed_action == expected
     assert robot_client.latest_display_action == expected
+    diagnostics = robot_client._get_gripper_diagnostics()
+    assert diagnostics["target"] == 40.0
+    assert diagnostics["sent"] == 40.0
 
 
 @pytest.mark.parametrize(
@@ -383,7 +386,10 @@ def test_live_display_startup_failure_does_not_block_client(monkeypatch):
 
 
 def test_capture_raw_observation_adds_task_and_logs_display(monkeypatch, robot_client):
-    observation = {"right_tactile": np.zeros((8, 8, 3), dtype=np.uint8)}
+    observation = {
+        "right_tactile": np.zeros((8, 8, 3), dtype=np.uint8),
+        "right_gripper.pos": np.float32(64.5),
+    }
     displayed = []
     monkeypatch.setattr(robot_client.robot, "get_observation", lambda: dict(observation))
     monkeypatch.setattr(robot_client, "_log_live_observation", displayed.append)
@@ -392,6 +398,119 @@ def test_capture_raw_observation_adds_task_and_logs_display(monkeypatch, robot_c
 
     assert captured == {**observation, "task": "move the cup"}
     assert displayed == [captured]
+    diagnostics = robot_client._get_gripper_diagnostics()
+    assert diagnostics["feedback"] == pytest.approx(64.5)
+    assert diagnostics["feedback_age_ms"] >= 0.0
+
+
+def test_gripper_diagnostics_track_target_sent_feedback_and_age(robot_client):
+    robot_client._remember_gripper_feedback({"right_gripper.pos": np.float32(65.0)})
+    robot_client._remember_gripper_action(
+        {"right_gripper.pos": 60.0},
+        {"right_gripper.pos": 61.5},
+    )
+    feedback_at = robot_client.latest_right_gripper_feedback_at
+    assert feedback_at is not None
+
+    diagnostics = robot_client._get_gripper_diagnostics(now=feedback_at + 0.25)
+
+    assert diagnostics == {
+        "target": 60.0,
+        "sent": 61.5,
+        "feedback": 65.0,
+        "error": 3.5,
+        "feedback_age_ms": 250.0,
+        "target_min": 60.0,
+        "target_max": 60.0,
+        "sent_min": 61.5,
+        "sent_max": 61.5,
+        "feedback_min": 65.0,
+        "feedback_max": 65.0,
+    }
+
+
+def test_gripper_diagnostics_use_target_as_dry_run_sent_value(robot_client):
+    robot_client._remember_gripper_action({"right_gripper.pos": 72.0}, None)
+
+    diagnostics = robot_client._get_gripper_diagnostics()
+
+    assert diagnostics["target"] == 72.0
+    assert diagnostics["sent"] == 72.0
+    assert np.isnan(diagnostics["feedback"])
+    assert np.isnan(diagnostics["error"])
+    assert np.isnan(diagnostics["feedback_age_ms"])
+    assert diagnostics["target_min"] == 72.0
+    assert diagnostics["target_max"] == 72.0
+    assert diagnostics["sent_min"] == 72.0
+    assert diagnostics["sent_max"] == 72.0
+    assert np.isnan(diagnostics["feedback_min"])
+    assert np.isnan(diagnostics["feedback_max"])
+
+
+def test_gripper_diagnostics_report_and_reset_window_ranges(robot_client):
+    robot_client._remember_gripper_action(
+        {"right_gripper.pos": 90.0},
+        {"right_gripper.pos": 89.0},
+    )
+    robot_client._remember_gripper_action(
+        {"right_gripper.pos": 60.0},
+        {"right_gripper.pos": 61.0},
+    )
+    robot_client._remember_gripper_feedback({"right_gripper.pos": 88.0})
+    robot_client._remember_gripper_feedback({"right_gripper.pos": 64.0})
+
+    diagnostics = robot_client._get_gripper_diagnostics(reset_window=True)
+    after_reset = robot_client._get_gripper_diagnostics()
+
+    assert diagnostics["target_min"] == 60.0
+    assert diagnostics["target_max"] == 90.0
+    assert diagnostics["sent_min"] == 61.0
+    assert diagnostics["sent_max"] == 89.0
+    assert diagnostics["feedback_min"] == 64.0
+    assert diagnostics["feedback_max"] == 88.0
+    assert after_reset["target"] == 60.0
+    assert after_reset["sent"] == 61.0
+    assert after_reset["feedback"] == 64.0
+    assert np.isnan(after_reset["target_min"])
+    assert np.isnan(after_reset["sent_min"])
+    assert np.isnan(after_reset["feedback_min"])
+
+
+def test_gripper_diagnostics_are_thread_safe(robot_client):
+    errors = []
+
+    def write_diagnostics():
+        try:
+            for value in range(500):
+                robot_client._remember_gripper_action(
+                    {"right_gripper.pos": value},
+                    {"right_gripper.pos": value + 1},
+                )
+                robot_client._remember_gripper_feedback({"right_gripper.pos": value + 2})
+        except Exception as error:
+            errors.append(error)
+
+    writer = threading.Thread(target=write_diagnostics)
+    writer.start()
+    while writer.is_alive():
+        snapshot = robot_client._get_gripper_diagnostics()
+        assert set(snapshot) == {
+            "target",
+            "sent",
+            "feedback",
+            "error",
+            "feedback_age_ms",
+            "target_min",
+            "target_max",
+            "sent_min",
+            "sent_max",
+            "feedback_min",
+            "feedback_max",
+        }
+    writer.join()
+
+    assert errors == []
+    assert robot_client._get_gripper_diagnostics()["feedback"] == 501.0
 
 
 def test_robot_client_config_exposes_live_display_settings():
