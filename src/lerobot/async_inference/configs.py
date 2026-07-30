@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -141,6 +142,18 @@ class RobotClientConfig:
         default="both",
         metadata={"help": "Robot arms allowed to receive actions: both, left, or right"},
     )
+    startup_right_gripper_position: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional right gripper position commanded once after the robot connects"
+        },
+    )
+    startup_right_gripper_hold_s: float = field(
+        default=0.0,
+        metadata={
+            "help": "Seconds to hold startup_right_gripper_position after policy execution begins"
+        },
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -216,6 +229,22 @@ class RobotClientConfig:
                 f"got {self.controlled_arms}"
             )
 
+        if self.startup_right_gripper_position is not None:
+            if not math.isfinite(self.startup_right_gripper_position):
+                raise ValueError("startup_right_gripper_position must be finite")
+            if self.controlled_arms == "left":
+                raise ValueError(
+                    "startup_right_gripper_position cannot be used when controlled_arms='left'"
+                )
+        if self.startup_right_gripper_hold_s < 0 or not math.isfinite(
+            self.startup_right_gripper_hold_s
+        ):
+            raise ValueError("startup_right_gripper_hold_s must be finite and non-negative")
+        if self.startup_right_gripper_hold_s > 0 and self.startup_right_gripper_position is None:
+            raise ValueError(
+                "startup_right_gripper_hold_s requires startup_right_gripper_position"
+            )
+
         if self.duration < 0:
             raise ValueError(f"duration must be non-negative, got {self.duration}")
 
@@ -249,6 +278,8 @@ class RobotClientConfig:
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "controlled_arms": self.controlled_arms,
+            "startup_right_gripper_position": self.startup_right_gripper_position,
+            "startup_right_gripper_hold_s": self.startup_right_gripper_hold_s,
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,

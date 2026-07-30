@@ -69,6 +69,9 @@ PYTHONUNBUFFERED=1 python -m lerobot.async_inference.robot_client \
   --pretrained_name_or_path="$CKPT" \
   --policy_device=cuda \
   --client_device=cpu \
+  --controlled_arms=right \
+  --startup_right_gripper_position=100.0 \
+  --startup_right_gripper_hold_s=0.0 \
   --actions_per_chunk=30 \
   --chunk_size_threshold=0.5 \
   --aggregate_fn_name=weighted_average \
@@ -87,6 +90,14 @@ PYTHONUNBUFFERED=1 python -m lerobot.async_inference.robot_client \
   --duration=5 \
   --task="$TASK"
 ```
+
+`startup_right_gripper_position` 使用机器人 action 坐标。当前右臂
+`piper_follower` 标定为 `homing_offset=0`、`range_min=0`、`range_max=105`、
+`drive_mode=0`，clean38 数据集开头一秒的右夹爪 action 中位数为 `101.7`，因此
+`100.0` 表示与采集一致的默认张开位置，`0.0` 是闭合端。client 连接后只发送一次
+该位置；`startup_right_gripper_hold_s=0.0` 不覆盖任何后续模型动作。只有显式将保持
+时间设为正数时，才会在正式动作开始后的指定时间内覆盖 `right_gripper.pos`；右臂
+六个关节始终执行策略输出。不传这两个参数时保持原有行为。
 
 checkpoint 路径由 GPU server 读取，因此 client 命令中的路径必须是 GPU 服务器上的路径。
 

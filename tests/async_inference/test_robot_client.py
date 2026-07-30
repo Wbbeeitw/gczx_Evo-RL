@@ -531,6 +531,121 @@ def test_robot_client_config_exposes_live_display_settings():
     assert config_dict["display_compressed_images"] is False
 
 
+def test_robot_client_config_exposes_startup_right_gripper_settings():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        controlled_arms="right",
+        startup_right_gripper_position=100.0,
+        startup_right_gripper_hold_s=1.5,
+    )
+
+    config_dict = config.to_dict()
+    assert config_dict["startup_right_gripper_position"] == 100.0
+    assert config_dict["startup_right_gripper_hold_s"] == 1.5
+
+
+@pytest.mark.parametrize(
+    "position, hold_s, controlled_arms, expected_message",
+    [
+        (float("nan"), 0.0, "right", "must be finite"),
+        (0.0, -1.0, "right", "finite and non-negative"),
+        (None, 1.0, "right", "requires startup_right_gripper_position"),
+        (0.0, 0.0, "left", "controlled_arms='left'"),
+    ],
+)
+def test_robot_client_config_rejects_invalid_startup_right_gripper_settings(
+    position, hold_s, controlled_arms, expected_message
+):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match=expected_message):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            controlled_arms=controlled_arms,
+            startup_right_gripper_position=position,
+            startup_right_gripper_hold_s=hold_s,
+        )
+
+
+def test_startup_right_gripper_command_and_hold(monkeypatch, robot_client):
+    sent_actions = []
+    robot_client.robot.action_features = {
+        "right_joint.pos": float,
+        "right_gripper.pos": float,
+    }
+    robot_client.config.startup_right_gripper_position = 0.0
+    robot_client.config.startup_right_gripper_hold_s = 1.5
+    monkeypatch.setattr(
+        robot_client.robot,
+        "send_action",
+        lambda action: sent_actions.append(action) or dict(action),
+    )
+
+    robot_client._command_startup_right_gripper_position()
+    held = robot_client._apply_startup_right_gripper_hold(
+        {"right_joint.pos": 12.0, "right_gripper.pos": -25.0},
+        now=100.0,
+    )
+    still_held = robot_client._apply_startup_right_gripper_hold(
+        {"right_joint.pos": 13.0, "right_gripper.pos": -30.0},
+        now=101.49,
+    )
+    released = robot_client._apply_startup_right_gripper_hold(
+        {"right_joint.pos": 14.0, "right_gripper.pos": -35.0},
+        now=101.5,
+    )
+
+    assert sent_actions == [{"right_gripper.pos": 0.0}]
+    assert held == {"right_joint.pos": 12.0, "right_gripper.pos": 0.0}
+    assert still_held == {"right_joint.pos": 13.0, "right_gripper.pos": 0.0}
+    assert released == {"right_joint.pos": 14.0, "right_gripper.pos": -35.0}
+    assert robot_client.startup_right_gripper_hold_finished is True
+
+
+def test_startup_right_gripper_hold_preserves_policy_target_in_diagnostics(
+    monkeypatch, robot_client
+):
+    from lerobot.async_inference.helpers import TimedAction
+
+    robot_client.robot.action_features = {
+        "right_joint.pos": float,
+        "right_gripper.pos": float,
+    }
+    robot_client.config.controlled_arms = "right"
+    robot_client.config.startup_right_gripper_position = 0.0
+    robot_client.config.startup_right_gripper_hold_s = 10.0
+    robot_client.action_queue.put(
+        TimedAction(
+            action=torch.tensor([12.0, -25.0]),
+            timestep=0,
+            timestamp=time.time(),
+        )
+    )
+    sent_actions = []
+    monkeypatch.setattr(
+        robot_client.robot,
+        "send_action",
+        lambda action: sent_actions.append(dict(action)) or dict(action),
+    )
+
+    robot_client.control_loop_action()
+
+    assert sent_actions == [{"right_joint.pos": 12.0, "right_gripper.pos": 0.0}]
+    diagnostics = robot_client._get_gripper_diagnostics()
+    assert diagnostics["target"] == -25.0
+    assert diagnostics["sent"] == 0.0
+
+
 def test_robot_client_config_rejects_invalid_controlled_arms():
     from lerobot.async_inference.configs import RobotClientConfig
     from tests.mocks.mock_robot import MockRobotConfig

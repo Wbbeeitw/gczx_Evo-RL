@@ -129,8 +129,23 @@ class RobotClient:
         self.right_gripper_sent_max = None
         self.right_gripper_feedback_min = None
         self.right_gripper_feedback_max = None
+        self.startup_right_gripper_hold_started_at = None
+        self.startup_right_gripper_hold_finished = False
         self.robot = make_robot_from_config(config.robot)
+        if (
+            config.startup_right_gripper_position is not None
+            and "right_gripper.pos" not in self.robot.action_features
+        ):
+            raise ValueError(
+                "startup_right_gripper_position requires robot action feature "
+                "'right_gripper.pos'"
+            )
         self.robot.connect()
+        try:
+            self._command_startup_right_gripper_position()
+        except BaseException:
+            self.robot.disconnect()
+            raise
 
         if config.controlled_arms != "both":
             suppressed_prefix = "left_" if config.controlled_arms == "right" else "right_"
@@ -628,6 +643,52 @@ class RobotClient:
             action = {key: value for key, value in action.items() if not key.startswith("right_")}
         return action
 
+    def _command_startup_right_gripper_position(self) -> None:
+        position = self.config.startup_right_gripper_position
+        if position is None:
+            return
+
+        action = {"right_gripper.pos": float(position)}
+        sent_action = action if self.config.dry_run_actions else self.robot.send_action(action)
+        self._remember_gripper_action(action, sent_action)
+        self._remember_display_action(sent_action)
+        sent_position = None if sent_action is None else sent_action.get("right_gripper.pos")
+        self.logger.info(
+            "Startup right gripper position commanded target=%.2f sent=%.2f dry_run=%s hold_s=%.2f",
+            position,
+            float("nan") if sent_position is None else sent_position,
+            self.config.dry_run_actions,
+            self.config.startup_right_gripper_hold_s,
+        )
+
+    def _apply_startup_right_gripper_hold(
+        self,
+        action: dict[str, float],
+        now: float | None = None,
+    ) -> dict[str, float]:
+        position = self.config.startup_right_gripper_position
+        hold_s = self.config.startup_right_gripper_hold_s
+        if position is None or hold_s <= 0 or self.startup_right_gripper_hold_finished:
+            return action
+
+        now = time.perf_counter() if now is None else now
+        if self.startup_right_gripper_hold_started_at is None:
+            self.startup_right_gripper_hold_started_at = now
+            self.logger.info(
+                "Startup right gripper hold started position=%.2f duration=%.2fs",
+                position,
+                hold_s,
+            )
+
+        if now - self.startup_right_gripper_hold_started_at < hold_s:
+            held_action = dict(action)
+            held_action["right_gripper.pos"] = float(position)
+            return held_action
+
+        self.startup_right_gripper_hold_finished = True
+        self.logger.info("Startup right gripper hold complete; policy now controls the gripper")
+        return action
+
     def _remember_display_action(self, action: dict[str, Any] | None) -> None:
         if action is None:
             return
@@ -764,7 +825,8 @@ class RobotClient:
             if action_tensor is None:
                 return None
 
-            action_dict = self._action_tensor_to_action_dict(action_tensor)
+            policy_action_dict = self._action_tensor_to_action_dict(action_tensor)
+            action_dict = self._apply_startup_right_gripper_hold(policy_action_dict)
             send_started_at = time.perf_counter()
             try:
                 performed_action = (
@@ -783,7 +845,7 @@ class RobotClient:
                 self.latest_action = self.rtc_action_queue.get_action_count() - 1
                 self.executed_action_count = self.rtc_action_queue.get_action_count()
             display_action = performed_action if performed_action is not None else action_dict
-            self._remember_gripper_action(action_dict, performed_action)
+            self._remember_gripper_action(policy_action_dict, performed_action)
             self._remember_display_action(display_action)
             return performed_action
 
@@ -803,7 +865,8 @@ class RobotClient:
         if timed_action is None:
             return None
 
-        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        policy_action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        action_dict = self._apply_startup_right_gripper_hold(policy_action_dict)
         send_started_at = time.perf_counter()
         performed_action = (
             action_dict if self.config.dry_run_actions else self.robot.send_action(action_dict)
@@ -816,7 +879,7 @@ class RobotClient:
             self.latest_action = timed_action.get_timestep()
             self.executed_action_count += 1
         display_action = performed_action if performed_action is not None else action_dict
-        self._remember_gripper_action(action_dict, performed_action)
+        self._remember_gripper_action(policy_action_dict, performed_action)
         self._remember_display_action(display_action)
 
         if verbose:
