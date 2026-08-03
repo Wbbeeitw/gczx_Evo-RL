@@ -65,12 +65,16 @@ class TactileRuntime:
         calibration_interval: float = 0.05,
         calibration_warmup_frames: int = 20,
         calibration_reducer: str = "median",
+        reconnect_on_error: bool = False,
+        reconnect_interval: float = 0.25,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         if read_mode not in {"auto_push", "distributed_poll"}:
             raise ValueError(f"Unsupported tactile read mode: {read_mode}")
         if calibration_reducer not in {"mean", "median"}:
             raise ValueError(f"Unsupported calibration reducer: {calibration_reducer}")
+        if reconnect_interval <= 0:
+            raise ValueError("reconnect_interval must be greater than zero")
 
         self.driver = driver
         self.read_mode = read_mode
@@ -80,6 +84,8 @@ class TactileRuntime:
         self.calibration_interval = calibration_interval
         self.calibration_warmup_frames = max(int(calibration_warmup_frames), 0)
         self.calibration_reducer = calibration_reducer
+        self.reconnect_on_error = reconnect_on_error
+        self.reconnect_interval = reconnect_interval
         self.logger = logger or logging.getLogger(__name__)
 
         self._lock = threading.Lock()
@@ -88,6 +94,11 @@ class TactileRuntime:
         self._last_error: Exception | None = None
         self._latest_frame: Optional[TactileFrame] = None
         self._frame_event = threading.Event()
+        self._recovery_event = threading.Event()
+        self._recovery_event.set()
+        self._recovering = False
+        self._dropout_started_at: float | None = None
+        self._reconnect_count = 0
         self.offsets: Dict[str, np.ndarray] = {
             name: np.zeros(3, dtype=np.float32) for name in SENSOR_NAMES
         }
@@ -111,7 +122,13 @@ class TactileRuntime:
 
         self._running = True
         self._last_error = None
-        self._thread = threading.Thread(target=self._loop, name="tactile-runtime", daemon=True)
+        with self._lock:
+            self._recovering = False
+            self._dropout_started_at = None
+            self._recovery_event.set()
+        self._thread = threading.Thread(
+            target=self._loop, name="tactile-runtime", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -137,6 +154,10 @@ class TactileRuntime:
             raise RuntimeError("Tactile runtime thread did not stop.") from close_error
 
         self._thread = None
+        with self._lock:
+            self._recovering = False
+            self._dropout_started_at = None
+            self._recovery_event.set()
         if close_error is not None:
             raise close_error
 
@@ -153,7 +174,9 @@ class TactileRuntime:
         deadline = time.time() + timeout
         while time.time() < deadline:
             frame = self.get_latest_frame(copy_frame=True)
-            if frame is not None and (after_timestamp is None or frame.timestamp > after_timestamp):
+            if frame is not None and (
+                after_timestamp is None or frame.timestamp > after_timestamp
+            ):
                 return frame
             time.sleep(0.01)
         return None
@@ -164,6 +187,27 @@ class TactileRuntime:
             if self._latest_frame is None:
                 return None
             return self._latest_frame.copy() if copy_frame else self._latest_frame
+
+    @property
+    def is_recovering(self) -> bool:
+        with self._lock:
+            return self._recovering
+
+    @property
+    def dropout_duration_s(self) -> float:
+        with self._lock:
+            started_at = self._dropout_started_at
+        if started_at is None:
+            return 0.0
+        return max(time.monotonic() - started_at, 0.0)
+
+    @property
+    def reconnect_count(self) -> int:
+        with self._lock:
+            return self._reconnect_count
+
+    def wait_until_recovered(self, timeout: float | None = None) -> bool:
+        return self._recovery_event.wait(timeout=timeout)
 
     def get_snapshot(self, copy_snapshot: bool = True) -> Optional[TactileSnapshot]:
         """Return a calibrated snapshot (thread-safe)."""
@@ -221,10 +265,14 @@ class TactileRuntime:
 
         sample_count = sample_count or self.calibration_samples
         sample_interval = (
-            sample_interval if sample_interval is not None else self.calibration_interval
+            sample_interval
+            if sample_interval is not None
+            else self.calibration_interval
         )
         warmup_frames = (
-            self.calibration_warmup_frames if warmup_frames is None else max(int(warmup_frames), 0)
+            self.calibration_warmup_frames
+            if warmup_frames is None
+            else max(int(warmup_frames), 0)
         )
         reducer = self.calibration_reducer if reducer is None else reducer
         if reducer not in {"mean", "median"}:
@@ -266,7 +314,9 @@ class TactileRuntime:
         with self._lock:
             for name in SENSOR_NAMES:
                 if samples[name]:
-                    self.offsets[name] = self._reduce_calibration_samples(samples[name], reducer)
+                    self.offsets[name] = self._reduce_calibration_samples(
+                        samples[name], reducer
+                    )
                 else:
                     self.offsets[name] = np.zeros(3, dtype=np.float32)
                 offsets[name] = self.offsets[name].copy()
@@ -301,7 +351,9 @@ class TactileRuntime:
     # Persistence
     # ------------------------------------------------------------------
 
-    def save_snapshot_npz(self, path: str, snapshot: Optional[TactileSnapshot] = None) -> str:
+    def save_snapshot_npz(
+        self, path: str, snapshot: Optional[TactileSnapshot] = None
+    ) -> str:
         """Save a snapshot as a compressed .npz file."""
         snapshot = snapshot or self.get_snapshot(copy_snapshot=True)
         if snapshot is None:
@@ -340,10 +392,16 @@ class TactileRuntime:
                 else:
                     frame = None  # distributed poll not used in camera mode
             except Exception as exc:
-                self._last_error = exc
-                self._running = False
-                self.logger.error("Tactile runtime stopped after read failure: %s", exc)
-                break
+                if not self.reconnect_on_error:
+                    self._last_error = exc
+                    self._running = False
+                    self.logger.error(
+                        "Tactile runtime stopped after read failure: %s", exc
+                    )
+                    break
+                frame = self._recover_after_read_failure(exc)
+                if frame is None:
+                    break
 
             if frame is not None:
                 with self._lock:
@@ -355,8 +413,89 @@ class TactileRuntime:
             if self.read_mode == "distributed_poll":
                 time.sleep(self.poll_interval)
 
+    def _recover_after_read_failure(self, error: Exception) -> Optional[TactileFrame]:
+        with self._lock:
+            if not self._recovering:
+                self._dropout_started_at = time.monotonic()
+            self._recovering = True
+            self._last_error = error
+            self._recovery_event.clear()
+
+        self.logger.error(
+            "Tactile runtime read failed; waiting for the serial device to reconnect: %s",
+            error,
+        )
+        initialized = False
+        attempt = 0
+
+        while self._running:
+            if not initialized:
+                attempt += 1
+                try:
+                    self.driver.force_close()
+                except Exception:
+                    self.logger.warning(
+                        "Failed to close tactile serial port before reconnect.",
+                        exc_info=True,
+                    )
+
+                time.sleep(self.reconnect_interval)
+                if not self._running:
+                    break
+
+                try:
+                    self.driver.initialize()
+                except Exception as reconnect_error:
+                    with self._lock:
+                        self._last_error = reconnect_error
+                    if attempt == 1 or attempt % 10 == 0:
+                        self.logger.warning(
+                            "Tactile reconnect attempt %d failed: %s",
+                            attempt,
+                            reconnect_error,
+                        )
+                    continue
+                initialized = True
+
+            try:
+                frame = self.driver.read_frame(timeout=self.read_timeout)
+            except Exception as reconnect_error:
+                with self._lock:
+                    self._last_error = reconnect_error
+                initialized = False
+                continue
+
+            if frame is None:
+                continue
+
+            recovered_at = time.monotonic()
+            with self._lock:
+                started_at = self._dropout_started_at
+                dropout_duration = (
+                    0.0 if started_at is None else max(recovered_at - started_at, 0.0)
+                )
+                self._latest_frame = frame
+                self._frame_event.set()
+                self._recovering = False
+                self._dropout_started_at = None
+                self._last_error = None
+                self._reconnect_count += 1
+                reconnect_count = self._reconnect_count
+                self._recovery_event.set()
+
+            self.logger.info(
+                "Tactile serial stream recovered after %.3fs (reconnect_count=%d).",
+                dropout_duration,
+                reconnect_count,
+            )
+            return frame
+
+        return None
+
     @staticmethod
-    def _reduce_calibration_samples(samples: list[np.ndarray], reducer: str) -> np.ndarray:
+    def _reduce_calibration_samples(
+        samples: list[np.ndarray], reducer: str
+    ) -> np.ndarray:
         stacked = np.stack(samples, axis=0)
         if reducer == "median":
             return np.median(stacked, axis=0).astype(np.float32)

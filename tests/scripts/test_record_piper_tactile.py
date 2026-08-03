@@ -11,6 +11,7 @@ from lerobot.scripts.lerobot_record_piper_tactile import (
     _FrameWriter,
     _log_live_frame,
     _missing_left_wrist_frame,
+    _recover_tactile_cameras_after_episode_dropout,
     _recalibrate_tactile_cameras,
     parse_args,
 )
@@ -108,7 +109,9 @@ def test_frame_writer_reports_sustained_queue_overload() -> None:
 
 def test_disconnect_hardware_cleans_partially_connected_arms() -> None:
     class FakeArm:
-        def __init__(self, *, is_connected: bool = False, process_running: bool = False) -> None:
+        def __init__(
+            self, *, is_connected: bool = False, process_running: bool = False
+        ) -> None:
             self.is_connected = is_connected
             self._process = object() if process_running else None
             self.disconnect_calls = 0
@@ -157,7 +160,9 @@ def test_disconnect_hardware_retries_partial_tactile_runtime_cleanup() -> None:
             self.camera._runtime = None
 
     arm = FakeArm()
-    robot = SimpleNamespace(left_arm=arm, right_arm=SimpleNamespace(is_connected=False, cameras={}))
+    robot = SimpleNamespace(
+        left_arm=arm, right_arm=SimpleNamespace(is_connected=False, cameras={})
+    )
     teleop = SimpleNamespace(is_connected=False)
     logger = logging.getLogger(__name__)
 
@@ -211,6 +216,42 @@ def test_recalibrate_tactile_cameras_propagates_failure() -> None:
 
     with pytest.raises(RuntimeError, match="sensor must be unloaded"):
         _recalibrate_tactile_cameras(robot, logging.getLogger(__name__))
+
+
+def test_episode_dropout_waits_for_reconnect_and_recalibrates() -> None:
+    class RecoveringTactileCamera:
+        def __init__(self) -> None:
+            self.is_recovering = True
+            self.is_connected = True
+            self.wait_calls = 0
+            self.calibrate_calls = 0
+
+        def wait_until_recovered(self, timeout: float) -> bool:
+            assert timeout == 0.25
+            self.wait_calls += 1
+            self.is_recovering = False
+            return True
+
+        def calibrate(self) -> None:
+            self.calibrate_calls += 1
+
+    left_tactile = RecoveringTactileCamera()
+    right_tactile = RecoveringTactileCamera()
+    robot = SimpleNamespace(
+        left_arm=SimpleNamespace(cameras={"tactile": left_tactile}),
+        right_arm=SimpleNamespace(cameras={"tactile": right_tactile}),
+    )
+
+    _recover_tactile_cameras_after_episode_dropout(
+        robot,
+        logging.getLogger(__name__),
+        input_fn=lambda _: "RECOVER",
+    )
+
+    assert left_tactile.wait_calls == 1
+    assert right_tactile.wait_calls == 1
+    assert left_tactile.calibrate_calls == 1
+    assert right_tactile.calibrate_calls == 1
 
 
 def test_missing_left_wrist_black_fill() -> None:
@@ -352,3 +393,42 @@ def test_tactile_recalibration_cli_can_be_disabled(monkeypatch) -> None:
     args = parse_args()
 
     assert args.tactile_calibrate_after_episode is False
+
+
+def test_tactile_dropout_recovery_cli(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "lerobot-record-piper-tactile",
+            "--task",
+            "test task",
+            "--left-follower-can",
+            "can0",
+            "--right-follower-can",
+            "can1",
+            "--left-leader-can",
+            "can2",
+            "--right-leader-can",
+            "can3",
+            "--top-camera",
+            "top",
+            "--right-wrist-camera",
+            "right-wrist",
+            "--right-tactile-port",
+            "/dev/serial/by-id/right-tactile",
+            "--dataset.repo_id",
+            "test/repo",
+            "--tactile-dropout-policy",
+            "recover",
+            "--tactile-hold-last-max-ms",
+            "500",
+            "--tactile-reconnect-interval-s",
+            "0.25",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.tactile_dropout_policy == "recover"
+    assert args.tactile_hold_last_max_ms == 500.0
+    assert args.tactile_reconnect_interval_s == 0.25

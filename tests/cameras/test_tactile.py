@@ -1,10 +1,15 @@
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import lerobot.cameras.tactile.camera_tactile as tactile_camera_module
-from lerobot.cameras.tactile import TactileCamera, TactileCameraConfig
+from lerobot.cameras.tactile import (
+    TactileCamera,
+    TactileCameraConfig,
+    TactileDropoutError,
+)
 from lerobot.cameras.tactile.driver import TactileSensorDriver
 from lerobot.cameras.tactile.protocol import TactileSerialProtocol
 from lerobot.cameras.tactile.runtime import TactileRuntime
@@ -28,7 +33,9 @@ class _NoFrameEvent:
 
 
 def _connected_camera() -> TactileCamera:
-    camera = TactileCamera(TactileCameraConfig(port="unused", calibrate_on_connect=False))
+    camera = TactileCamera(
+        TactileCameraConfig(port="unused", calibrate_on_connect=False)
+    )
     camera._runtime = SimpleNamespace(_running=True)
     camera._read_thread = _AliveThread()
     return camera
@@ -94,6 +101,26 @@ def test_async_read_rejects_stale_cached_frame(monkeypatch) -> None:
         camera.async_read(timeout_ms=1000)
 
 
+def test_async_read_holds_last_frame_during_short_reconnect() -> None:
+    camera = _connected_camera()
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    camera._latest_frame = frame
+    camera._runtime.is_recovering = True
+    camera._runtime.dropout_duration_s = 0.25
+
+    assert camera.async_read(timeout_ms=1000) is frame
+
+
+def test_async_read_rejects_reconnect_beyond_hold_limit() -> None:
+    camera = _connected_camera()
+    camera._latest_frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    camera._runtime.is_recovering = True
+    camera._runtime.dropout_duration_s = 0.75
+
+    with pytest.raises(TactileDropoutError, match="exceeding hold-last limit"):
+        camera.async_read(timeout_ms=1000)
+
+
 def test_read_latest_requires_a_capture_timestamp() -> None:
     camera = _connected_camera()
     camera._latest_frame = np.zeros((2, 2, 3), dtype=np.uint8)
@@ -132,8 +159,12 @@ def test_connect_cleans_up_runtime_when_calibration_fails(monkeypatch) -> None:
 
     monkeypatch.setattr(tactile_camera_module, "TactileSensorDriver", FakeDriver)
     monkeypatch.setattr(tactile_camera_module, "TactileRuntime", FakeRuntime)
-    monkeypatch.setattr(tactile_camera_module, "TactileVisualizer", lambda **kwargs: object())
-    camera = TactileCamera(TactileCameraConfig(port="unused", calibrate_on_connect=True))
+    monkeypatch.setattr(
+        tactile_camera_module, "TactileVisualizer", lambda **kwargs: object()
+    )
+    camera = TactileCamera(
+        TactileCameraConfig(port="unused", calibrate_on_connect=True)
+    )
 
     with pytest.raises(RuntimeError, match="calibration failed"):
         camera.connect()
@@ -185,6 +216,55 @@ def test_runtime_stops_after_terminal_serial_error() -> None:
     assert driver.close_calls == 1
 
 
+def test_runtime_reconnects_and_preserves_calibration_offsets() -> None:
+    class RecoveringDriver:
+        def __init__(self) -> None:
+            self.initialize_calls = 0
+            self.force_close_calls = 0
+            self.close_calls = 0
+            self.read_calls = 0
+
+        def initialize(self) -> None:
+            self.initialize_calls += 1
+
+        def read_frame(self, timeout: float):
+            del timeout
+            self.read_calls += 1
+            if self.read_calls == 1:
+                raise OSError("device removed")
+            if self.read_calls == 2:
+                return SimpleNamespace(timestamp=1.0, copy=lambda: None)
+            return None
+
+        def force_close(self) -> None:
+            self.force_close_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    driver = RecoveringDriver()
+    runtime = TactileRuntime(
+        driver=driver,
+        read_timeout=0.01,
+        reconnect_on_error=True,
+        reconnect_interval=0.001,
+    )
+    expected_offset = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    runtime.offsets["index_middle"] = expected_offset.copy()
+
+    runtime.start()
+    assert runtime.wait_until_recovered(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while runtime.reconnect_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    assert runtime.reconnect_count == 1
+    assert driver.initialize_calls == 2
+    assert driver.force_close_calls == 1
+    np.testing.assert_array_equal(runtime.offsets["index_middle"], expected_offset)
+    runtime.stop()
+
+
 def test_driver_force_close_skips_graceful_disable() -> None:
     class FakeSerial:
         is_open = True
@@ -200,7 +280,9 @@ def test_driver_force_close_skips_graceful_disable() -> None:
     serial_port = FakeSerial()
     driver.ser = serial_port
     driver.auto_push_mode = True
-    driver.disable_auto_push_mode = lambda: pytest.fail("graceful disable must be skipped")
+    driver.disable_auto_push_mode = lambda: pytest.fail(
+        "graceful disable must be skipped"
+    )
 
     driver.force_close()
 
@@ -290,7 +372,9 @@ def test_disconnect_can_retry_after_runtime_stop_failure() -> None:
             if self.stop_calls == 1:
                 raise OSError("close failed")
 
-    camera = TactileCamera(TactileCameraConfig(port="unused", calibrate_on_connect=False))
+    camera = TactileCamera(
+        TactileCameraConfig(port="unused", calibrate_on_connect=False)
+    )
     runtime = FlakyRuntime()
     camera._runtime = runtime
     camera._driver = object()

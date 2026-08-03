@@ -14,8 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .camera_tactile import TactileCamera
+from .camera_tactile import TactileCamera, TactileDropoutError
 from .configuration_tactile import TactileCameraConfig
 from .visualizer import TactileVisualizer
 
-__all__ = ["TactileCamera", "TactileCameraConfig", "TactileVisualizer"]
+__all__ = [
+    "TactileCamera",
+    "TactileCameraConfig",
+    "TactileDropoutError",
+    "TactileVisualizer",
+]

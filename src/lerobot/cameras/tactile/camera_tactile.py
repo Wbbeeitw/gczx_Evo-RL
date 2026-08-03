@@ -37,6 +37,10 @@ from .visualizer import TactileVisualizer
 logger = logging.getLogger(__name__)
 
 
+class TactileDropoutError(RuntimeError):
+    """Raised when a tactile serial dropout exceeds the bounded frame-hold window."""
+
+
 class TactileCamera(Camera):
     """A virtual camera that renders tactile pressure data as RGB images.
 
@@ -122,6 +126,8 @@ class TactileCamera(Camera):
             calibration_interval=cfg.calibration_interval,
             calibration_warmup_frames=cfg.calibration_warmup_frames,
             calibration_reducer=cfg.calibration_reducer,
+            reconnect_on_error=cfg.reconnect_on_error,
+            reconnect_interval=cfg.reconnect_interval_s,
             logger=logger,
         )
 
@@ -160,7 +166,9 @@ class TactileCamera(Camera):
                 self._runtime.stop()
             except Exception:
                 cleanup_succeeded = False
-                logger.exception("TactileCamera(%s) cleanup failed after connect error.", cfg.port)
+                logger.exception(
+                    "TactileCamera(%s) cleanup failed after connect error.", cfg.port
+                )
             if cleanup_succeeded:
                 self._runtime = None
                 self._driver = None
@@ -171,7 +179,9 @@ class TactileCamera(Camera):
                 self._new_frame_event.clear()
             raise
 
-        logger.info("TactileCamera(%s) connected (image=%s)", cfg.port, self._image_shape)
+        logger.info(
+            "TactileCamera(%s) connected (image=%s)", cfg.port, self._image_shape
+        )
 
     @check_if_not_connected
     def read(self) -> NDArray[Any]:
@@ -207,6 +217,16 @@ class TactileCamera(Camera):
                 frame = self._latest_frame
                 timestamp = self._latest_timestamp
                 now = time.perf_counter()
+                runtime = self._runtime
+                if runtime is not None and getattr(runtime, "is_recovering", False):
+                    dropout_ms = runtime.dropout_duration_s * 1e3
+                    if frame is not None and dropout_ms <= self.config.hold_last_max_ms:
+                        return frame
+                    raise TactileDropoutError(
+                        f"TactileCamera({self.config.port}) serial dropout lasted "
+                        f"{dropout_ms:.1f} ms, exceeding hold-last limit "
+                        f"{self.config.hold_last_max_ms:.1f} ms."
+                    )
                 if frame is not None and timestamp is not None:
                     age_ms = (now - timestamp) * 1e3
                     if age_ms <= timeout_ms:
@@ -219,6 +239,15 @@ class TactileCamera(Camera):
                     f"TactileCamera({self.config.port}): timed out waiting for a fresh frame "
                     f"after {timeout_ms} ms."
                 )
+
+    @property
+    def is_recovering(self) -> bool:
+        return self._runtime is not None and self._runtime.is_recovering
+
+    def wait_until_recovered(self, timeout: float | None = None) -> bool:
+        if self._runtime is None:
+            return False
+        return self._runtime.wait_until_recovered(timeout=timeout)
 
     @check_if_not_connected
     def read_latest(self, max_age_ms: int = 1000) -> NDArray[Any]:
@@ -279,7 +308,9 @@ class TactileCamera(Camera):
 
         logger.info("TactileCamera(%s) disconnected.", self.config.port)
         if runtime_error is not None:
-            raise RuntimeError(f"TactileCamera({self.config.port}) failed to stop cleanly.") from runtime_error
+            raise RuntimeError(
+                f"TactileCamera({self.config.port}) failed to stop cleanly."
+            ) from runtime_error
 
     # ------------------------------------------------------------------
     # Internal

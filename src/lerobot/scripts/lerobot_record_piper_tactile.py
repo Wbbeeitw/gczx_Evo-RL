@@ -49,20 +49,33 @@ from queue import Full, Queue
 import numpy as np
 
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+from lerobot.cameras.tactile.camera_tactile import TactileDropoutError
 from lerobot.cameras.tactile.configuration_tactile import TactileCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.pipeline_features import (
+    aggregate_pipeline_dataset_features,
+    create_initial_features,
+)
 from lerobot.datasets.utils import combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.processor import make_default_processors
 from lerobot.robots import make_robot_from_config
-from lerobot.robots.bi_piper_follower import BiPiperFollowerConfig, BiPiperXFollowerConfig
+from lerobot.robots.bi_piper_follower import (
+    BiPiperFollowerConfig,
+    BiPiperXFollowerConfig,
+)
 from lerobot.robots.piper_follower import PiperFollowerConfigBase
 from lerobot.robots.piper_follower.piper_follower import _has_active_resources
 from lerobot.teleoperators import make_teleoperator_from_config
-from lerobot.teleoperators.bi_piper_leader import BiPiperLeaderConfig, BiPiperXLeaderConfig
+from lerobot.teleoperators.bi_piper_leader import (
+    BiPiperLeaderConfig,
+    BiPiperXLeaderConfig,
+)
 from lerobot.teleoperators.piper_leader import PiperLeaderConfigBase
-from lerobot.utils.control_utils import sanity_check_bimanual_piper_pair, sanity_check_dataset_name
+from lerobot.utils.control_utils import (
+    sanity_check_bimanual_piper_pair,
+    sanity_check_dataset_name,
+)
 from lerobot.utils.utils import init_logging
 
 _FRAME_QUEUE_SENTINEL = object()
@@ -79,7 +92,9 @@ def _start_live_display(enabled: bool):
     return log_rerun_data
 
 
-def _log_live_frame(display_logger, observation, action, *, compress_images: bool) -> None:
+def _log_live_frame(
+    display_logger, observation, action, *, compress_images: bool
+) -> None:
     if display_logger is None:
         return
     display_logger(
@@ -99,7 +114,9 @@ class _FrameWriter:
         self._closed = False
         self._abort_event = threading.Event()
         self._error: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, name="frame-writer", daemon=False)
+        self._thread = threading.Thread(
+            target=self._run, name="frame-writer", daemon=False
+        )
         self._thread.start()
 
     def submit(self, frame: dict[str, object]) -> None:
@@ -111,7 +128,9 @@ class _FrameWriter:
                 try:
                     self._queue.put(frame, timeout=1.0)
                 except Full as queue_error:
-                    raise RuntimeError("Frame writer queue stayed full for 1 second.") from queue_error
+                    raise RuntimeError(
+                        "Frame writer queue stayed full for 1 second."
+                    ) from queue_error
         if error is not None:
             raise RuntimeError("Frame writer failed while adding a frame.") from error
         self._raise_if_failed()
@@ -168,6 +187,23 @@ def _episode_metadata(outcome: str) -> dict[str, str]:
 
 
 def _recalibrate_tactile_cameras(robot, logger: logging.Logger) -> None:
+    tactile_cameras = _tactile_cameras(robot)
+
+    if not tactile_cameras:
+        return
+
+    logger.info(
+        "  Recalibrating tactile sensors; keep both fingertips unloaded and still."
+    )
+    for side, camera in tactile_cameras:
+        logger.info("  Recalibrating %s tactile sensor...", side)
+        camera.calibrate()
+    logger.info(
+        "  Tactile recalibration complete. The next episode can now be started."
+    )
+
+
+def _tactile_cameras(robot) -> list[tuple[str, object]]:
     tactile_cameras = []
     for side in ("left", "right"):
         arm = getattr(robot, f"{side}_arm", None)
@@ -175,15 +211,63 @@ def _recalibrate_tactile_cameras(robot, logger: logging.Logger) -> None:
         camera = cameras.get("tactile")
         if camera is not None:
             tactile_cameras.append((side, camera))
+    return tactile_cameras
 
+
+def _recover_tactile_cameras_after_episode_dropout(
+    robot,
+    logger: logging.Logger,
+    *,
+    input_fn=input,
+    wait_timeout_s: float = 0.25,
+) -> None:
+    tactile_cameras = _tactile_cameras(robot)
     if not tactile_cameras:
-        return
+        raise RuntimeError(
+            "Tactile dropout recovery requested without tactile cameras."
+        )
 
-    logger.info("  Recalibrating tactile sensors; keep both fingertips unloaded and still.")
-    for side, camera in tactile_cameras:
-        logger.info("  Recalibrating %s tactile sensor...", side)
-        camera.calibrate()
-    logger.info("  Tactile recalibration complete. The next episode can now be started.")
+    logger.warning(
+        "Current episode was discarded. Waiting for all tactile serial streams to recover."
+    )
+    while True:
+        while True:
+            recovering = [
+                (side, camera)
+                for side, camera in tactile_cameras
+                if camera.is_recovering
+            ]
+            if not recovering:
+                break
+            for _, camera in recovering:
+                camera.wait_until_recovered(timeout=wait_timeout_s)
+
+        disconnected = [
+            side for side, camera in tactile_cameras if not camera.is_connected
+        ]
+        if disconnected:
+            raise RuntimeError(
+                f"Tactile cameras stopped while recovering: {', '.join(disconnected)}"
+            )
+
+        logger.info("All tactile serial streams are live again.")
+        response = input_fn(
+            "Remove all objects from both grippers, keep both fingertips unloaded and still, "
+            "then enter RECOVER: "
+        ).strip()
+        if response != "RECOVER":
+            print(
+                "  Recovery not confirmed. Enter RECOVER when both tactile sensors are unloaded."
+            )
+            continue
+        if any(camera.is_recovering for _, camera in tactile_cameras):
+            logger.warning(
+                "A tactile sensor dropped again during confirmation; waiting again."
+            )
+            continue
+        break
+
+    _recalibrate_tactile_cameras(robot, logger)
 
 
 def _missing_left_wrist_frame(
@@ -228,9 +312,13 @@ def _disconnect_hardware(robot, teleop, logger: logging.Logger) -> None:
                 if not _has_active_resources(target):
                     break
                 if attempt == 0:
-                    logger.warning("%s still has active resources; retrying once.", device_name)
+                    logger.warning(
+                        "%s still has active resources; retrying once.", device_name
+                    )
                     continue
-                logger.error("%s still has active resources after disconnect retry.", device_name)
+                logger.error(
+                    "%s still has active resources after disconnect retry.", device_name
+                )
 
 
 @contextmanager
@@ -245,6 +333,7 @@ def _disconnect_on_error(robot, teleop, logger: logging.Logger):
 # ---------------------------------------------------------------------------
 # Keyboard helpers
 # ---------------------------------------------------------------------------
+
 
 @contextmanager
 def cbreak_stdin(enabled: bool):
@@ -294,6 +383,7 @@ def prompt_outcome(default_value: str) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record bimanual Piper teleop episodes + tactile into LeRobot format."
@@ -307,24 +397,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-leader-can", type=str, required=True)
     parser.add_argument("--robot-id", type=str, default="bi_piper_collect")
     parser.add_argument("--teleop-id", type=str, default="bi_piper_leader_collect")
-    parser.add_argument("--robot-type", choices=("bi_piper_follower", "bi_piperx_follower"),
-                        default="bi_piperx_follower")
+    parser.add_argument(
+        "--robot-type",
+        choices=("bi_piper_follower", "bi_piperx_follower"),
+        default="bi_piperx_follower",
+    )
     # Cameras
-    parser.add_argument("--top-camera", type=str, required=True, help="RealSense serial for ego camera.")
-    parser.add_argument("--left-wrist-camera", type=str, default=None,
-                        help="RealSense serial for left wrist. If omitted, --missing-left-wrist-fill is used.")
+    parser.add_argument(
+        "--top-camera", type=str, required=True, help="RealSense serial for ego camera."
+    )
+    parser.add_argument(
+        "--left-wrist-camera",
+        type=str,
+        default=None,
+        help="RealSense serial for left wrist. If omitted, --missing-left-wrist-fill is used.",
+    )
     parser.add_argument("--right-wrist-camera", type=str, required=True)
     parser.add_argument("--ego-camera-side", choices=("left", "right"), default="left")
-    parser.add_argument("--missing-left-wrist-fill", choices=("black", "copy-ego", "copy-right-wrist"),
-                        default="black")
+    parser.add_argument(
+        "--missing-left-wrist-fill",
+        choices=("black", "copy-ego", "copy-right-wrist"),
+        default="black",
+    )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--camera-warmup-s", type=int, default=2)
     # Tactile
-    parser.add_argument("--left-tactile-port", type=str, default=None,
-                        help="Serial port for left tactile controller.")
-    parser.add_argument("--right-tactile-port", type=str, default=None,
-                        help="Serial port for right tactile controller.")
+    parser.add_argument(
+        "--left-tactile-port",
+        type=str,
+        default=None,
+        help="Serial port for left tactile controller.",
+    )
+    parser.add_argument(
+        "--right-tactile-port",
+        type=str,
+        default=None,
+        help="Serial port for right tactile controller.",
+    )
     parser.add_argument("--tactile-output-size", type=int, default=256)
     parser.add_argument("--tactile-heatmap-vmin", type=float, default=0.0)
     parser.add_argument("--tactile-heatmap-vmax", type=float, default=25.5)
@@ -332,6 +442,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tactile-gamma", type=float, default=0.75)
     parser.add_argument("--tactile-rgb-vmax-fz", type=float, default=25.5)
     parser.add_argument("--tactile-rgb-vmax-shear", type=float, default=12.8)
+    parser.add_argument(
+        "--tactile-dropout-policy",
+        choices=("fail", "recover"),
+        default="fail",
+        help=(
+            "'fail' stops collection after a terminal serial error. 'recover' briefly holds the "
+            "last tactile frame, then discards the current episode and waits for reconnection."
+        ),
+    )
+    parser.add_argument("--tactile-hold-last-max-ms", type=float, default=500.0)
+    parser.add_argument("--tactile-reconnect-interval-s", type=float, default=0.25)
     parser.add_argument(
         "--tactile-calibrate-on-connect",
         action=argparse.BooleanOptionalAction,
@@ -350,17 +471,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--follower-startup-sleep-s", type=float, default=0.5)
     parser.add_argument("--leader-startup-sleep-s", type=float, default=0.1)
     parser.add_argument("--follower-speed-ratio", type=int, default=100)
-    parser.add_argument("--follower-high-follow", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--follower-high-follow", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--leader-command-speed-ratio", type=int, default=100)
-    parser.add_argument("--leader-command-high-follow", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--leader-process-isolation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--leader-command-high-follow",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--leader-process-isolation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--require-calibration", action="store_true", default=False)
     # Recording
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--episode-seconds", type=float, default=0,
-                        help="Max seconds per episode. 0 = unlimited.")
-    parser.add_argument("--default-trajectory-type", choices=("success", "failure", "ongoing"),
-                        default="success")
+    parser.add_argument(
+        "--episode-seconds",
+        type=float,
+        default=0,
+        help="Max seconds per episode. 0 = unlimited.",
+    )
+    parser.add_argument(
+        "--default-trajectory-type",
+        choices=("success", "failure", "ongoing"),
+        default="success",
+    )
     parser.add_argument(
         "--display-data",
         "--display_data",
@@ -376,11 +514,20 @@ def parse_args() -> argparse.Namespace:
         help="JPEG-compress images sent to Rerun to reduce viewer bandwidth and memory usage.",
     )
     # Dataset
-    parser.add_argument("--dataset.repo_id", type=str, required=True, dest="dataset_repo_id",
-                        help="HuggingFace-style dataset name, e.g. my_org/my_dataset")
+    parser.add_argument(
+        "--dataset.repo_id",
+        type=str,
+        required=True,
+        dest="dataset_repo_id",
+        help="HuggingFace-style dataset name, e.g. my_org/my_dataset",
+    )
     parser.add_argument("--dataset.root", type=str, default=None, dest="dataset_root")
-    parser.add_argument("--dataset.push_to_hub", action="store_true", default=False, dest="push_to_hub")
-    parser.add_argument("--dataset.private", action="store_true", default=False, dest="private_ds")
+    parser.add_argument(
+        "--dataset.push_to_hub", action="store_true", default=False, dest="push_to_hub"
+    )
+    parser.add_argument(
+        "--dataset.private", action="store_true", default=False, dest="private_ds"
+    )
     parser.add_argument("--dataset.vcodec", type=str, default="h264", dest="vcodec")
     parser.add_argument(
         "--save-mode",
@@ -421,6 +568,7 @@ def parse_args() -> argparse.Namespace:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     args = parse_args()
     init_logging()
@@ -438,19 +586,25 @@ def main():
     if args.left_wrist_camera:
         left_cams["wrist"] = RealSenseCameraConfig(
             serial_number_or_name=args.left_wrist_camera,
-            width=args.width, height=args.height, fps=args.fps,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
             warmup_s=args.camera_warmup_s,
         )
     right_cams = {
         "wrist": RealSenseCameraConfig(
             serial_number_or_name=args.right_wrist_camera,
-            width=args.width, height=args.height, fps=args.fps,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
             warmup_s=args.camera_warmup_s,
         ),
     }
     ego_cfg = RealSenseCameraConfig(
         serial_number_or_name=args.top_camera,
-        width=args.width, height=args.height, fps=args.fps,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
         warmup_s=args.camera_warmup_s,
     )
     if args.ego_camera_side == "left":
@@ -470,6 +624,9 @@ def main():
             heatmap_colormap=args.tactile_colormap,
             heatmap_gamma=args.tactile_gamma,
             calibrate_on_connect=args.tactile_calibrate_on_connect,
+            reconnect_on_error=args.tactile_dropout_policy == "recover",
+            reconnect_interval_s=args.tactile_reconnect_interval_s,
+            hold_last_max_ms=args.tactile_hold_last_max_ms,
         )
     if args.right_tactile_port:
         right_cams["tactile"] = TactileCameraConfig(
@@ -482,47 +639,58 @@ def main():
             heatmap_colormap=args.tactile_colormap,
             heatmap_gamma=args.tactile_gamma,
             calibrate_on_connect=args.tactile_calibrate_on_connect,
+            reconnect_on_error=args.tactile_dropout_policy == "recover",
+            reconnect_interval_s=args.tactile_reconnect_interval_s,
+            hold_last_max_ms=args.tactile_hold_last_max_ms,
         )
 
-    robot_cfg = BiPiperXFollowerConfig(
-        id=args.robot_id,
-        left_arm_config=PiperFollowerConfigBase(
-            port=args.left_follower_can,
-            startup_sleep_s=args.follower_startup_sleep_s,
-            speed_ratio=args.follower_speed_ratio,
-            high_follow=args.follower_high_follow,
-            require_calibration=args.require_calibration,
-            cameras=left_cams,
-        ),
-        right_arm_config=PiperFollowerConfigBase(
-            port=args.right_follower_can,
-            startup_sleep_s=args.follower_startup_sleep_s,
-            speed_ratio=args.follower_speed_ratio,
-            high_follow=args.follower_high_follow,
-            require_calibration=args.require_calibration,
-            cameras=right_cams,
-        ),
-    ) if args.robot_type == "bi_piperx_follower" else BiPiperFollowerConfig(
-        id=args.robot_id,
-        left_arm_config=PiperFollowerConfigBase(
-            port=args.left_follower_can,
-            startup_sleep_s=args.follower_startup_sleep_s,
-            speed_ratio=args.follower_speed_ratio,
-            high_follow=args.follower_high_follow,
-            require_calibration=args.require_calibration,
-            cameras=left_cams,
-        ),
-        right_arm_config=PiperFollowerConfigBase(
-            port=args.right_follower_can,
-            startup_sleep_s=args.follower_startup_sleep_s,
-            speed_ratio=args.follower_speed_ratio,
-            high_follow=args.follower_high_follow,
-            require_calibration=args.require_calibration,
-            cameras=right_cams,
-        ),
+    robot_cfg = (
+        BiPiperXFollowerConfig(
+            id=args.robot_id,
+            left_arm_config=PiperFollowerConfigBase(
+                port=args.left_follower_can,
+                startup_sleep_s=args.follower_startup_sleep_s,
+                speed_ratio=args.follower_speed_ratio,
+                high_follow=args.follower_high_follow,
+                require_calibration=args.require_calibration,
+                cameras=left_cams,
+            ),
+            right_arm_config=PiperFollowerConfigBase(
+                port=args.right_follower_can,
+                startup_sleep_s=args.follower_startup_sleep_s,
+                speed_ratio=args.follower_speed_ratio,
+                high_follow=args.follower_high_follow,
+                require_calibration=args.require_calibration,
+                cameras=right_cams,
+            ),
+        )
+        if args.robot_type == "bi_piperx_follower"
+        else BiPiperFollowerConfig(
+            id=args.robot_id,
+            left_arm_config=PiperFollowerConfigBase(
+                port=args.left_follower_can,
+                startup_sleep_s=args.follower_startup_sleep_s,
+                speed_ratio=args.follower_speed_ratio,
+                high_follow=args.follower_high_follow,
+                require_calibration=args.require_calibration,
+                cameras=left_cams,
+            ),
+            right_arm_config=PiperFollowerConfigBase(
+                port=args.right_follower_can,
+                startup_sleep_s=args.follower_startup_sleep_s,
+                speed_ratio=args.follower_speed_ratio,
+                high_follow=args.follower_high_follow,
+                require_calibration=args.require_calibration,
+                cameras=right_cams,
+            ),
+        )
     )
 
-    teleop_cfg_cls = BiPiperXLeaderConfig if args.robot_type == "bi_piperx_follower" else BiPiperLeaderConfig
+    teleop_cfg_cls = (
+        BiPiperXLeaderConfig
+        if args.robot_type == "bi_piperx_follower"
+        else BiPiperLeaderConfig
+    )
     teleop_cfg = teleop_cfg_cls(
         id=args.teleop_id,
         left_arm_config=PiperLeaderConfigBase(
@@ -550,7 +718,11 @@ def main():
     sanity_check_dataset_name(args.dataset_repo_id, None)
 
     # Build feature schema from robot (same as lerobot-record)
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    (
+        teleop_action_processor,
+        robot_action_processor,
+        robot_observation_processor,
+    ) = make_default_processors()
     observation_features = dict(robot.observation_features)
     camera_keys = list(robot._cameras_ft)
     if args.left_wrist_camera is None:
@@ -572,15 +744,23 @@ def main():
 
     num_cameras = max(len(camera_keys), 1)
     if args.image_writer_threads is None:
-        image_writer_threads = num_cameras if args.save_mode == "serial" else 4 * num_cameras
+        image_writer_threads = (
+            num_cameras if args.save_mode == "serial" else 4 * num_cameras
+        )
     else:
         image_writer_threads = args.image_writer_threads
     if image_writer_threads < 1:
         raise ValueError("--image-writer-threads must be >= 1.")
     image_writer_queue_size = (
-        args.fps * num_cameras if args.image_writer_queue_size is None else args.image_writer_queue_size
+        args.fps * num_cameras
+        if args.image_writer_queue_size is None
+        else args.image_writer_queue_size
     )
-    frame_writer_queue_size = args.fps if args.frame_writer_queue_size is None else args.frame_writer_queue_size
+    frame_writer_queue_size = (
+        args.fps
+        if args.frame_writer_queue_size is None
+        else args.frame_writer_queue_size
+    )
     if image_writer_queue_size < 1:
         raise ValueError("--image-writer-queue-size must be >= 1.")
     if frame_writer_queue_size < 1:
@@ -652,7 +832,9 @@ def main():
                 )
                 # Offload dataset writes to background thread for smooth teleop
                 state_keys = list(robot._motors_ft.keys())
-                frame_writer = _FrameWriter(dataset, max_queue_size=frame_writer_queue_size)
+                frame_writer = _FrameWriter(
+                    dataset, max_queue_size=frame_writer_queue_size
+                )
 
                 try:
                     with cbreak_stdin(interactive):
@@ -662,11 +844,17 @@ def main():
                             obs = robot.get_observation()
                             action = teleop.get_action()
                             robot.send_action(action)
-                            display_observation = dict(obs) if display_logger is not None else None
+                            display_observation = (
+                                dict(obs) if display_logger is not None else None
+                            )
 
                             # Build frame (fast path)
-                            state_vals = np.array([float(obs[k]) for k in state_keys], dtype=np.float32)
-                            action_vals = np.array([float(action[k]) for k in state_keys], dtype=np.float32)
+                            state_vals = np.array(
+                                [float(obs[k]) for k in state_keys], dtype=np.float32
+                            )
+                            action_vals = np.array(
+                                [float(action[k]) for k in state_keys], dtype=np.float32
+                            )
                             frame_data = {
                                 "observation.state": state_vals,
                                 "action": action_vals,
@@ -698,7 +886,8 @@ def main():
                             elapsed = time.perf_counter() - start_t
                             print(
                                 f"\r  frames={frame_count:05d} elapsed={elapsed:.1f}s",
-                                end="", flush=True,
+                                end="",
+                                flush=True,
                             )
 
                             # Check keyboard
@@ -708,17 +897,26 @@ def main():
                             if key:
                                 k = key.lower()
                                 if k == "s":
-                                    outcome = "success"; break
+                                    outcome = "success"
+                                    break
                                 if k == "f":
-                                    outcome = "failure"; break
+                                    outcome = "failure"
+                                    break
                                 if k == "o":
-                                    outcome = "ongoing"; break
+                                    outcome = "ongoing"
+                                    break
                                 if k == "d":
-                                    outcome = "discard"; break
+                                    outcome = "discard"
+                                    break
                                 if k == "q":
-                                    outcome = "quit"; quit_session = True; break
+                                    outcome = "quit"
+                                    quit_session = True
+                                    break
 
-                            if args.episode_seconds > 0 and elapsed >= args.episode_seconds:
+                            if (
+                                args.episode_seconds > 0
+                                and elapsed >= args.episode_seconds
+                            ):
                                 break
 
                             # Frame pacing
@@ -728,8 +926,24 @@ def main():
                                 time.sleep(sleep_s)
                             elif time.perf_counter() - loop_t > frame_period * 2:
                                 # Resync if we're falling behind
-                                start_t = time.perf_counter() - frame_count * frame_period
+                                start_t = (
+                                    time.perf_counter() - frame_count * frame_period
+                                )
 
+                except TactileDropoutError as error:
+                    print()
+                    frame_writer.abort()
+                    dataset.clear_episode_buffer(delete_videos=True)
+                    logger.error(
+                        "Tactile dropout exceeded the %.1f ms hold-last limit; "
+                        "discarded episode %03d after %d buffered frames: %s",
+                        args.tactile_hold_last_max_ms,
+                        episode_index,
+                        frame_count,
+                        error,
+                    )
+                    _recover_tactile_cameras_after_episode_dropout(robot, logger)
+                    continue
                 except BaseException:
                     _disconnect_hardware(robot, teleop, logger)
                     frame_writer.abort()
@@ -778,7 +992,9 @@ def main():
                 saved_count += 1
                 logger.info(
                     "  Saved episode %03d as '%s' (%d frames).",
-                    episode_index, outcome, frame_count,
+                    episode_index,
+                    outcome,
+                    frame_count,
                 )
 
                 if args.tactile_calibrate_after_episode:
@@ -796,7 +1012,9 @@ def main():
         logger.info(
             "Dataset finalized: %d episodes saved to %s.\n"
             "To inspect: lerobot-dataset-report --dataset %s",
-            saved_count, dataset.root, args.dataset_repo_id,
+            saved_count,
+            dataset.root,
+            args.dataset_repo_id,
         )
 
     if args.push_to_hub:

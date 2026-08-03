@@ -104,6 +104,11 @@ class TactileCameraConfig(CameraConfig):
     calibration_warmup_frames: int = 20
     calibration_reducer: str = "median"
 
+    # --- Dropout recovery ---
+    reconnect_on_error: bool = False
+    reconnect_interval_s: float = 0.25
+    hold_last_max_ms: float = 500.0
+
     # CameraConfig overrides — tactile camera always produces images at
     # (2*output_size, 2*output_size, 3).  These are set in __post_init__.
     fps: int | None = field(default=10, init=False, repr=False)
@@ -120,4 +125,10 @@ class TactileCameraConfig(CameraConfig):
         if self.read_mode not in {"auto_push", "distributed_poll"}:
             raise ValueError(f"Unsupported read_mode: {self.read_mode}")
         if self.calibration_reducer not in {"mean", "median"}:
-            raise ValueError(f"Unsupported calibration_reducer: {self.calibration_reducer}")
+            raise ValueError(
+                f"Unsupported calibration_reducer: {self.calibration_reducer}"
+            )
+        if self.reconnect_interval_s <= 0:
+            raise ValueError("reconnect_interval_s must be greater than zero")
+        if self.hold_last_max_ms < 0:
+            raise ValueError("hold_last_max_ms must be non-negative")
