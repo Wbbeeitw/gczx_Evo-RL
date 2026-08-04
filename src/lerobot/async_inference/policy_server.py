@@ -30,7 +30,7 @@ import pickle  # nosec
 import threading
 import time
 from concurrent import futures
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
