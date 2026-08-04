@@ -221,6 +221,7 @@ lerobot-export-boundary-frames="lerobot.scripts.lerobot_export_boundary_frames:m
 lerobot-tactile-monitor="lerobot.scripts.lerobot_tactile_monitor:main"
 lerobot-tactile-preview="lerobot.scripts.lerobot_tactile_preview:main"
 lerobot-record-piper-tactile="lerobot.scripts.lerobot_record_piper_tactile:main"
+lerobot-xr0-tactile-report="lerobot.scripts.lerobot_xr0_tactile_report:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.packages.find]

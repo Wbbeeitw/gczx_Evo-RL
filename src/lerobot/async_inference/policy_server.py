@@ -25,19 +25,25 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import copy
+import csv
+import json
 import logging
 import pickle  # nosec
 import threading
 import time
 from concurrent import futures
 from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
+from PIL import Image
 
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.processor import (
@@ -74,6 +80,37 @@ class _TorchRNGSnapshot:
     state: torch.Tensor
 
 
+_DIAGNOSTIC_SUMMARY_FIELDS = (
+    "record_id",
+    "timestep",
+    "action_time_s",
+    "server_elapsed_s",
+    "rtc_prefix_length",
+    "tactile_pixel_mean_delta",
+    "tactile_pixel_max_delta",
+    "tactile_active_pixel_ratio",
+    "mean_abs_delta",
+    "max_abs_delta",
+    "suffix_mean_abs_delta",
+    "suffix_max_abs_delta",
+    "next_generated_action_delta",
+    "right_gripper_delta",
+    "right_gripper_suffix_delta",
+    "right_arm_joint_delta",
+    "right_joint_1_delta",
+    "right_joint_2_delta",
+    "right_joint_3_delta",
+    "right_joint_4_delta",
+    "right_joint_5_delta",
+    "right_joint_6_delta",
+    "most_affected_dimension",
+    "most_affected_score_std",
+    "diagnostic_time_s",
+    "action_npz",
+    "tactile_frame_prefixes",
+)
+
+
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     prefix = "policy_server"
     logger = get_logger(prefix)
@@ -103,10 +140,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._tactile_baselines: dict[str, torch.Tensor] = {}
         self._debug_qwen_text_enabled = False
         self._debug_tactile_counterfactual_enabled = False
+        self._diagnostic_record_count = 0
+        self._diagnostic_save_limit_logged = False
+        self._diagnostic_started_at = time.monotonic()
+        self._diagnostic_output_dir: Path | None = None
 
         # Attributes will be set by SendPolicyInstructions
         self.device = None
         self.policy_type = None
+        self.pretrained_name_or_path = None
         self.lerobot_features = None
         self.actions_per_chunk = None
         self.rtc_config = None
@@ -147,9 +189,46 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._last_tactile_action_debug_at = float("-inf")
         self._tactile_baseline_samples = {key: [] for key in self._tactile_image_keys}
         self._tactile_baselines = {}
+        self._diagnostic_record_count = 0
+        self._diagnostic_save_limit_logged = False
+        self._diagnostic_started_at = time.monotonic()
+        self._diagnostic_output_dir = None
         with self._diagnostic_state_lock:
             self._diagnostic_thread = None
             self._diagnostic_running = False
+
+    def _initialize_diagnostic_output(self) -> None:
+        root_value = self.config.debug_action_comparison_dir
+        if root_value is None:
+            return
+        if not self._debug_tactile_counterfactual_enabled:
+            self.logger.warning(
+                "XR0 action comparison output requested but tactile counterfactual is disabled; "
+                "no diagnostic files will be saved."
+            )
+            return
+
+        root = Path(root_value).expanduser()
+        session_name = datetime.now().strftime("session_%Y%m%d_%H%M%S_%f")
+        output_dir = root / session_name
+        (output_dir / "action_chunks").mkdir(parents=True, exist_ok=False)
+        if self.config.debug_action_comparison_save_images:
+            (output_dir / "tactile_frames").mkdir()
+        (output_dir / "reports").mkdir()
+        metadata = {
+            "created_at": datetime.now().astimezone().isoformat(),
+            "policy_type": self.policy_type,
+            "pretrained_name_or_path": self.pretrained_name_or_path,
+            "actions_per_chunk": self.actions_per_chunk,
+            "tactile_image_keys": list(self._tactile_image_keys),
+            "config": asdict(self.config),
+        }
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        self._diagnostic_output_dir = output_dir
+        self.logger.info("XR0 tactile diagnostic output directory: %s", output_dir)
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -191,6 +270,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.device = policy_specs.device
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
+        self.pretrained_name_or_path = policy_specs.pretrained_name_or_path
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self.rtc_config = policy_specs.rtc_config
@@ -254,6 +334,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.config.debug_tactile_counterfactual and self._tactile_image_keys
         )
         self._reset_diagnostic_state()
+        self._initialize_diagnostic_output()
 
         if self.config.debug_qwen_text and not self._debug_qwen_text_enabled:
             self.logger.warning(
@@ -585,10 +666,99 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return masked
 
     @staticmethod
+    def _action_dimension_layout(action_dim: int) -> dict[str, int]:
+        if action_dim >= 27:
+            return {
+                "left_gripper": 6,
+                **{f"left_joint_{index + 1}": 7 + index for index in range(6)},
+                "right_gripper": 20,
+                **{f"right_joint_{index + 1}": 21 + index for index in range(6)},
+            }
+        if action_dim >= 14:
+            return {
+                **{f"left_joint_{index + 1}": index for index in range(6)},
+                "left_gripper": 6,
+                **{f"right_joint_{index + 1}": 7 + index for index in range(6)},
+                "right_gripper": 13,
+            }
+        return {}
+
+    @classmethod
+    def _controlled_action_dimensions(
+        cls, action_dim: int, controlled_arms: str
+    ) -> dict[str, int]:
+        layout = cls._action_dimension_layout(action_dim)
+        if controlled_arms == "left":
+            return {
+                name: dim for name, dim in layout.items() if name.startswith("left_")
+            }
+        if controlled_arms == "right":
+            return {
+                name: dim for name, dim in layout.items() if name.startswith("right_")
+            }
+        return layout
+
+    @staticmethod
+    def _rtc_prefix_length(predict_kwargs: dict[str, Any], action_horizon: int) -> int:
+        previous_actions = predict_kwargs.get("prev_chunk_left_over")
+        execution_horizon = max(0, int(predict_kwargs.get("execution_horizon", 0)))
+        if previous_actions is None or execution_horizon == 0:
+            return 0
+        previous_horizon = int(previous_actions.shape[-2])
+        return min(execution_horizon, previous_horizon, action_horizon)
+
+    @staticmethod
+    def _to_unit_image_tensor(image: torch.Tensor) -> torch.Tensor:
+        unit = image.detach().float().cpu()
+        if unit.numel() and float(unit.max()) > 1.0:
+            unit = unit / 255.0
+        return unit.clamp(0.0, 1.0)
+
+    def _tactile_difference_metrics(
+        self, observation: Observation
+    ) -> tuple[
+        dict[str, float], dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ]:
+        differences = []
+        frames = {}
+        for key in self._tactile_image_keys:
+            current = observation.get(key)
+            baseline = self._tactile_baselines.get(key)
+            if not isinstance(current, torch.Tensor) or baseline is None:
+                continue
+            current_unit = self._to_unit_image_tensor(current)
+            baseline_unit = self._to_unit_image_tensor(baseline)
+            if current_unit.shape != baseline_unit.shape:
+                continue
+            difference = (current_unit - baseline_unit).abs()
+            differences.append(difference.reshape(-1))
+            frames[key] = (current_unit, baseline_unit, difference)
+
+        if not differences:
+            return {}, frames
+
+        combined = torch.cat(differences)
+        return {
+            "tactile_pixel_mean_delta": float(combined.mean().item()),
+            "tactile_pixel_max_delta": float(combined.max().item()),
+            "tactile_active_pixel_ratio": float(
+                (combined >= self.config.debug_tactile_active_pixel_threshold)
+                .float()
+                .mean()
+                .item()
+            ),
+        }, frames
+
+    @classmethod
     def _action_difference_metrics(
+        cls,
         primary_action: torch.Tensor,
         counterfactual_action: torch.Tensor,
-    ) -> dict[str, float]:
+        *,
+        prefix_length: int = 0,
+        action_std: torch.Tensor | None = None,
+        controlled_arms: str = "both",
+    ) -> dict[str, float | int | str]:
         primary = primary_action.detach().float().cpu()
         counterfactual = counterfactual_action.detach().float().cpu()
         if primary.ndim == 3:
@@ -598,14 +768,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         horizon = min(primary.shape[-2], counterfactual.shape[-2])
         action_dim = min(primary.shape[-1], counterfactual.shape[-1])
+        prefix_length = min(max(0, int(prefix_length)), horizon)
         delta = (
             primary[:horizon, :action_dim] - counterfactual[:horizon, :action_dim]
         ).abs()
-        metrics = {
+        metrics: dict[str, float | int | str] = {
             "mean_abs_delta": float(delta.mean().item()),
             "max_abs_delta": float(delta.max().item()),
+            "rtc_prefix_length": prefix_length,
         }
 
+        layout = cls._action_dimension_layout(action_dim)
         if action_dim >= 27:
             metrics.update(
                 {
@@ -624,7 +797,174 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     "right_arm_joint_delta": float(delta[:, 7:13].mean().item()),
                 }
             )
+
+        controlled_dimensions = cls._controlled_action_dimensions(
+            action_dim, controlled_arms
+        )
+        suffix_delta = delta[prefix_length:]
+        if suffix_delta.numel() == 0 or not controlled_dimensions:
+            metrics.update(
+                {
+                    "suffix_mean_abs_delta": 0.0,
+                    "suffix_max_abs_delta": 0.0,
+                    "next_generated_action_delta": 0.0,
+                    "most_affected_dimension": "none",
+                    "most_affected_score_std": 0.0,
+                }
+            )
+            return metrics
+
+        controlled_names = list(controlled_dimensions)
+        controlled_indices = [controlled_dimensions[name] for name in controlled_names]
+        controlled_suffix = suffix_delta[:, controlled_indices]
+        metrics.update(
+            {
+                "suffix_mean_abs_delta": float(controlled_suffix.mean().item()),
+                "suffix_max_abs_delta": float(controlled_suffix.max().item()),
+                "next_generated_action_delta": float(
+                    controlled_suffix[0].mean().item()
+                ),
+            }
+        )
+
+        for name, dimension in layout.items():
+            if name.startswith("right_joint_"):
+                metrics[f"{name}_delta"] = float(
+                    suffix_delta[:, dimension].mean().item()
+                )
+            elif name == "right_gripper":
+                metrics["right_gripper_suffix_delta"] = float(
+                    suffix_delta[:, dimension].mean().item()
+                )
+
+        effect_scores = controlled_suffix.mean(dim=0)
+        if action_std is not None:
+            std = action_std.detach().float().cpu()
+            if std.ndim == 3:
+                std = std.squeeze(0)
+            if std.ndim == 2 and std.shape[0] >= horizon and std.shape[1] >= action_dim:
+                suffix_std = (
+                    std[prefix_length:horizon, controlled_indices].abs().clamp_min(1e-6)
+                )
+                effect_scores = (controlled_suffix / suffix_std).mean(dim=0)
+
+        most_affected_index = int(effect_scores.argmax().item())
+        metrics["most_affected_dimension"] = controlled_names[most_affected_index]
+        metrics["most_affected_score_std"] = float(
+            effect_scores[most_affected_index].item()
+        )
         return metrics
+
+    @staticmethod
+    def _tensor_to_pil_image(image: torch.Tensor) -> Image.Image:
+        unit = image.detach().float().cpu()
+        while unit.ndim > 3 and unit.shape[0] == 1:
+            unit = unit.squeeze(0)
+        if unit.ndim == 2:
+            unit = unit.unsqueeze(-1)
+        elif unit.ndim == 3 and unit.shape[0] in {1, 3, 4}:
+            unit = unit.permute(1, 2, 0)
+        if unit.ndim != 3:
+            raise ValueError(f"Unsupported tactile image shape: {tuple(unit.shape)}")
+        if unit.shape[-1] == 1:
+            unit = unit.repeat(1, 1, 3)
+        array = (unit[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).numpy()
+        return Image.fromarray(array)
+
+    def _save_action_comparison_record(
+        self,
+        *,
+        timestep: int,
+        prefix_length: int,
+        primary_action: torch.Tensor,
+        counterfactual_action: torch.Tensor,
+        metrics: dict[str, float | int | str],
+        tactile_frames: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        diagnostic_time_s: float,
+    ) -> None:
+        output_dir = self._diagnostic_output_dir
+        if output_dir is None:
+            return
+        if (
+            self._diagnostic_record_count
+            >= self.config.debug_action_comparison_max_records
+        ):
+            if not self._diagnostic_save_limit_logged:
+                self.logger.warning(
+                    "XR0 diagnostic save limit reached (%d records); terminal diagnostics continue.",
+                    self.config.debug_action_comparison_max_records,
+                )
+                self._diagnostic_save_limit_logged = True
+            return
+
+        self._diagnostic_record_count += 1
+        record_id = self._diagnostic_record_count
+        stem = f"record_{record_id:06d}_step_{timestep:06d}"
+        action_path = output_dir / "action_chunks" / f"{stem}.npz"
+        primary_tensor = primary_action.detach().float().cpu()
+        counterfactual_tensor = counterfactual_action.detach().float().cpu()
+        if primary_tensor.ndim == 3:
+            primary_tensor = primary_tensor.squeeze(0)
+        if counterfactual_tensor.ndim == 3:
+            counterfactual_tensor = counterfactual_tensor.squeeze(0)
+        if primary_tensor.shape != counterfactual_tensor.shape:
+            raise ValueError(
+                "Primary and counterfactual action shapes must match before saving: "
+                f"{tuple(primary_tensor.shape)} != {tuple(counterfactual_tensor.shape)}"
+            )
+        primary = primary_tensor.numpy()
+        counterfactual = counterfactual_tensor.numpy()
+        np.savez_compressed(
+            action_path,
+            primary_actions=primary,
+            masked_actions=counterfactual,
+            absolute_delta=np.abs(primary - counterfactual),
+            rtc_prefix_length=np.asarray(prefix_length, dtype=np.int32),
+            timestep=np.asarray(timestep, dtype=np.int64),
+            action_time_s=np.asarray(timestep / self.config.fps, dtype=np.float64),
+        )
+
+        tactile_prefixes = []
+        if self.config.debug_action_comparison_save_images:
+            frame_dir = output_dir / "tactile_frames"
+            for key, (current, baseline, difference) in tactile_frames.items():
+                tactile_name = key.rsplit(".", maxsplit=1)[-1].replace("/", "_")
+                frame_prefix = f"{stem}_{tactile_name}"
+                self._tensor_to_pil_image(current).save(
+                    frame_dir / f"{frame_prefix}_current.jpg", quality=95
+                )
+                self._tensor_to_pil_image(baseline).save(
+                    frame_dir / f"{frame_prefix}_baseline.jpg", quality=95
+                )
+                self._tensor_to_pil_image(difference).save(
+                    frame_dir / f"{frame_prefix}_difference.jpg", quality=95
+                )
+                tactile_prefixes.append(frame_prefix)
+
+        row: dict[str, Any] = {
+            "record_id": record_id,
+            "timestep": timestep,
+            "action_time_s": timestep / self.config.fps,
+            "server_elapsed_s": time.monotonic() - self._diagnostic_started_at,
+            "rtc_prefix_length": prefix_length,
+            "diagnostic_time_s": diagnostic_time_s,
+            "action_npz": str(action_path.relative_to(output_dir)),
+            "tactile_frame_prefixes": ";".join(tactile_prefixes),
+            **metrics,
+        }
+        summary_path = output_dir / "summary.csv"
+        write_header = not summary_path.exists()
+        with summary_path.open("a", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=_DIAGNOSTIC_SUMMARY_FIELDS,
+                extrasaction="ignore",
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+        self.logger.info("Saved XR0 tactile diagnostic record: %s", action_path)
 
     def _run_xr0_diagnostics(
         self,
@@ -639,6 +979,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         run_counterfactual: bool,
     ) -> None:
         started_at = time.perf_counter()
+        counterfactual_action = None
         try:
             if self.shutdown_event.is_set() or not self.observation_queue.empty():
                 self.logger.debug(
@@ -690,12 +1031,32 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     finally:
                         self._restore_policy_rng_state(current_rng_state)
                     metrics = self._action_difference_metrics(
-                        primary_action, counterfactual_action
+                        primary_action,
+                        counterfactual_action,
+                        prefix_length=self._rtc_prefix_length(
+                            predict_kwargs, primary_action.shape[-2]
+                        ),
+                        action_std=getattr(policy, "_xr0_action_std", None),
+                        controlled_arms=getattr(
+                            getattr(policy, "config", None), "controlled_arms", "both"
+                        ),
                     )
             finally:
                 self._policy_inference_lock.release()
 
-            lines = ["[XR0 DEBUG]", f"timestep={timestep}"]
+            tactile_frames = {}
+            if metrics is not None:
+                tactile_metrics, tactile_frames = self._tactile_difference_metrics(
+                    observation
+                )
+                metrics.update(tactile_metrics)
+
+            diagnostic_time_s = time.perf_counter() - started_at
+            lines = [
+                "[XR0 TACTILE EFFECT]" if metrics is not None else "[XR0 DEBUG]",
+                f"timestep={timestep}",
+                f"action_time_s={timestep / self.config.fps:.3f}",
+            ]
             if full_text is not None:
                 lines.append(f"qwen_full={full_text}")
                 if self._tactile_image_keys and masked_text is None:
@@ -705,9 +1066,33 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             if run_counterfactual and metrics is None:
                 lines.append("tactile_action_counterfactual=SKIPPED_BASELINE_NOT_READY")
             elif metrics is not None:
-                lines.extend(f"{key}={value:.6f}" for key, value in metrics.items())
-            lines.append(f"diagnostic_time_s={time.perf_counter() - started_at:.3f}")
+                for key, value in metrics.items():
+                    if isinstance(value, float):
+                        lines.append(f"{key}={value:.6f}")
+                    else:
+                        lines.append(f"{key}={value}")
+            lines.append(f"diagnostic_time_s={diagnostic_time_s:.3f}")
             self.logger.info("\n%s", "\n".join(lines))
+
+            if (
+                self._diagnostic_output_dir is not None
+                and metrics is not None
+                and counterfactual_action is not None
+            ):
+                try:
+                    self._save_action_comparison_record(
+                        timestep=timestep,
+                        prefix_length=int(metrics["rtc_prefix_length"]),
+                        primary_action=primary_action,
+                        counterfactual_action=counterfactual_action,
+                        metrics=metrics,
+                        tactile_frames=tactile_frames,
+                        diagnostic_time_s=diagnostic_time_s,
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Failed to save XR0 tactile diagnostic record; inference remains active."
+                    )
         except Exception:
             self.logger.exception(
                 "XR0 diagnostic task failed; normal policy inference remains active."

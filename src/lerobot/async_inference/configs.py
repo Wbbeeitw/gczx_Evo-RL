@@ -105,6 +105,28 @@ class PolicyServerConfig:
             "help": "Initial unloaded observations used to build each tactile baseline"
         },
     )
+    debug_action_comparison_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional root directory for XR0 tactile action comparison records"
+        },
+    )
+    debug_action_comparison_save_images: bool = field(
+        default=False,
+        metadata={
+            "help": "Save current, unloaded-baseline, and difference tactile images"
+        },
+    )
+    debug_action_comparison_max_records: int = field(
+        default=1000,
+        metadata={"help": "Maximum XR0 tactile comparison records saved per session"},
+    )
+    debug_tactile_active_pixel_threshold: float = field(
+        default=0.05,
+        metadata={
+            "help": "Normalized tactile pixel-difference threshold used for active-area ratio"
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -138,6 +160,28 @@ class PolicyServerConfig:
         if self.debug_tactile_baseline_frames <= 0:
             raise ValueError("debug_tactile_baseline_frames must be positive")
 
+        if (
+            self.debug_action_comparison_dir is not None
+            and not self.debug_action_comparison_dir.strip()
+        ):
+            raise ValueError("debug_action_comparison_dir cannot be empty")
+
+        if (
+            self.debug_action_comparison_save_images
+            and self.debug_action_comparison_dir is None
+        ):
+            raise ValueError(
+                "debug_action_comparison_save_images requires debug_action_comparison_dir"
+            )
+
+        if self.debug_action_comparison_max_records <= 0:
+            raise ValueError("debug_action_comparison_max_records must be positive")
+
+        if not 0 <= self.debug_tactile_active_pixel_threshold <= 1:
+            raise ValueError(
+                "debug_tactile_active_pixel_threshold must be between zero and one"
+            )
+
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
         """Create a PolicyServerConfig from a dictionary."""
@@ -162,6 +206,10 @@ class PolicyServerConfig:
             "debug_tactile_counterfactual": self.debug_tactile_counterfactual,
             "debug_tactile_action_interval_s": self.debug_tactile_action_interval_s,
             "debug_tactile_baseline_frames": self.debug_tactile_baseline_frames,
+            "debug_action_comparison_dir": self.debug_action_comparison_dir,
+            "debug_action_comparison_save_images": self.debug_action_comparison_save_images,
+            "debug_action_comparison_max_records": self.debug_action_comparison_max_records,
+            "debug_tactile_active_pixel_threshold": self.debug_tactile_active_pixel_threshold,
         }
 
 
