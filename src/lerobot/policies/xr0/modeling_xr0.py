@@ -140,7 +140,11 @@ class XR0Policy(PreTrainedPolicy):
             torch.ones(config.chunk_size, config.max_action_dim, dtype=torch.float32),
             persistent=True,
         )
-        self.register_buffer("_xr0_action_stats_loaded", torch.tensor(0, dtype=torch.uint8), persistent=True)
+        self.register_buffer(
+            "_xr0_action_stats_loaded",
+            torch.tensor(0, dtype=torch.uint8),
+            persistent=True,
+        )
         self._maybe_load_xr0_action_stats()
         self._maybe_load_official_checkpoint()
         self.reset()
@@ -155,7 +159,9 @@ class XR0Policy(PreTrainedPolicy):
                 processor.tokenizer.padding_side = "right"
             return processor
         except Exception as exc:
-            logger.warning("Failed to load Qwen processor from %s: %s", qwen_variant, exc)
+            logger.warning(
+                "Failed to load Qwen processor from %s: %s", qwen_variant, exc
+            )
             return None
 
     def _maybe_load_xr0_action_stats(self) -> None:
@@ -188,7 +194,9 @@ class XR0Policy(PreTrainedPolicy):
         elif isinstance(payload, dict):
             state_dict = payload
         else:
-            raise ValueError(f"Unsupported XR0 checkpoint payload type: {type(payload)}")
+            raise ValueError(
+                f"Unsupported XR0 checkpoint payload type: {type(payload)}"
+            )
 
         remapped = {}
         for key, value in state_dict.items():
@@ -214,7 +222,9 @@ class XR0Policy(PreTrainedPolicy):
     def _get_image_keys(self) -> list[str]:
         available_keys = set(self.config.image_features.keys())
         if self.config.image_key_order:
-            missing_keys = [key for key in self.config.image_key_order if key not in available_keys]
+            missing_keys = [
+                key for key in self.config.image_key_order if key not in available_keys
+            ]
             if missing_keys:
                 raise ValueError(
                     "XR0 image_key_order contains keys not found in dataset features: "
@@ -222,7 +232,10 @@ class XR0Policy(PreTrainedPolicy):
                 )
             unused_keys = sorted(available_keys - set(self.config.image_key_order))
             if unused_keys:
-                logger.warning("XR0 will ignore image keys not listed in image_key_order: %s", unused_keys)
+                logger.warning(
+                    "XR0 will ignore image keys not listed in image_key_order: %s",
+                    unused_keys,
+                )
             return list(self.config.image_key_order)
         ordered_keys = [key for key in DEFAULT_IMAGE_KEY_ORDER if key in available_keys]
         ordered_keys.extend(sorted(available_keys - set(ordered_keys)))
@@ -238,8 +251,12 @@ class XR0Policy(PreTrainedPolicy):
         custom_description = self.config.image_key_descriptions.get(image_key)
         if custom_description:
             normalized = custom_description.strip().rstrip(".")
-            return DESCRIPTION_TO_NATIVE_VIEW_HEADING.get(normalized.lower(), normalized)
-        return DEFAULT_IMAGE_VIEW_HEADINGS.get(image_key, self._get_image_description(image_key).rstrip("."))
+            return DESCRIPTION_TO_NATIVE_VIEW_HEADING.get(
+                normalized.lower(), normalized
+            )
+        return DEFAULT_IMAGE_VIEW_HEADINGS.get(
+            image_key, self._get_image_description(image_key).rstrip(".")
+        )
 
     @staticmethod
     def _format_task_for_native_prompt(task: str) -> str:
@@ -304,7 +321,11 @@ class XR0Policy(PreTrainedPolicy):
             raise ValueError("XR0 requires at least one visual input feature.")
 
         first_image = batch[image_keys[0]]
-        batch_size = first_image.shape[0] if isinstance(first_image, Tensor) and first_image.ndim == 4 else 1
+        batch_size = (
+            first_image.shape[0]
+            if isinstance(first_image, Tensor) and first_image.ndim == 4
+            else 1
+        )
         tasks = self._tasks_from_batch(batch, batch_size)
 
         messages = []
@@ -324,11 +345,19 @@ class XR0Policy(PreTrainedPolicy):
                 content.append({"type": "image", "image": self._tensor_to_image(image)})
                 content.append({"type": "text", "text": "\n"})
             task = self._format_task_for_native_prompt(tasks[batch_index])
-            content.append({"type": "text", "text": f"Generate robot actions for the task:\n{task}"})
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"Generate robot actions for the task:\n{task}",
+                }
+            )
             messages.append(
                 [
                     {"role": "user", "content": content},
-                    {"role": "assistant", "content": [{"type": "text", "text": "<cot></cot>"}]},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "<cot></cot>"}],
+                    },
                 ]
             )
 
@@ -342,7 +371,9 @@ class XR0Policy(PreTrainedPolicy):
                 images_kwargs={"do_resize": False},
             )
         except TypeError:
-            texts = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            texts = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
             images = [
                 item["image"]
                 for message in messages
@@ -356,9 +387,144 @@ class XR0Policy(PreTrainedPolicy):
                 return_tensors="pt",
             )
 
-        return {key: value.to(self.device) if isinstance(value, Tensor) else value for key, value in inputs.items()}
+        return {
+            key: value.to(self.device) if isinstance(value, Tensor) else value
+            for key, value in inputs.items()
+        }
 
-    def _prepare_native_batch(self, batch: dict[str, Any], *, include_action: bool) -> dict[str, Any]:
+    def _prepare_debug_text_inputs(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if self.processor is None:
+            raise RuntimeError(
+                "XR0 debug text generation requires an available Qwen AutoProcessor."
+            )
+
+        image_keys = self._get_image_keys()
+        if not image_keys:
+            raise ValueError(
+                "XR0 debug text generation requires at least one visual input feature."
+            )
+
+        first_image = batch[image_keys[0]]
+        batch_size = (
+            first_image.shape[0]
+            if isinstance(first_image, Tensor) and first_image.ndim == 4
+            else 1
+        )
+        tasks = self._tasks_from_batch(batch, batch_size)
+        tactile_headings = [
+            self._get_image_view_heading(image_key)
+            for image_key in image_keys
+            if "tactile" in image_key.lower()
+        ]
+
+        messages = []
+        for batch_index in range(batch_size):
+            content = [
+                {
+                    "type": "text",
+                    "text": "The following observations are captured from multiple views.\n",
+                }
+            ]
+            for image_key in image_keys:
+                image = batch[image_key]
+                if isinstance(image, Tensor) and image.ndim == 4:
+                    image = image[batch_index]
+                heading = self._get_image_view_heading(image_key)
+                content.append({"type": "text", "text": f"# {heading}\n"})
+                content.append({"type": "image", "image": self._tensor_to_image(image)})
+                content.append({"type": "text", "text": "\n"})
+
+            if tactile_headings:
+                diagnostic_request = (
+                    "Describe the current gripper contact state using the tactile views and RGB views. "
+                    "For each tactile-equipped gripper, state whether it is unloaded, touching, firmly "
+                    "grasping, or possibly slipping. Do not propose robot actions. Respond in one concise line."
+                )
+            else:
+                diagnostic_request = (
+                    "Describe the visible gripper-object contact evidence from the RGB views. State when "
+                    "contact cannot be determined without tactile input. Do not propose robot actions. "
+                    "Respond in one concise line."
+                )
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Task context:\n{tasks[batch_index]}\n\n"
+                        f"Diagnostic request:\n{diagnostic_request}"
+                    ),
+                }
+            )
+            messages.append([{"role": "user", "content": content}])
+
+        try:
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                padding=True,
+                add_generation_prompt=True,
+                images_kwargs={"do_resize": False},
+            )
+        except TypeError:
+            texts = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            images = [
+                item["image"]
+                for message in messages
+                for item in message[0]["content"]
+                if item["type"] == "image"
+            ]
+            inputs = self.processor(
+                text=texts if isinstance(texts, list) else [texts],
+                images=images,
+                padding=True,
+                return_tensors="pt",
+            )
+
+        return {
+            key: value.to(self.device) if isinstance(value, Tensor) else value
+            for key, value in inputs.items()
+        }
+
+    @torch.no_grad()
+    def generate_debug_text(
+        self, batch: dict[str, Any], *, max_new_tokens: int = 24
+    ) -> list[str]:
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be greater than zero")
+
+        self.eval()
+        inputs = self._prepare_debug_text_inputs(batch)
+        generated_ids = self.model.vlm.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+        )
+        prompt_length = inputs["input_ids"].shape[1]
+        generated_tokens = generated_ids[:, prompt_length:]
+        decoder = getattr(self.processor, "batch_decode", None)
+        if decoder is None and hasattr(self.processor, "tokenizer"):
+            decoder = self.processor.tokenizer.batch_decode
+        if decoder is None:
+            raise RuntimeError("XR0 Qwen processor does not provide batch_decode.")
+        return [
+            text.strip()
+            for text in decoder(
+                generated_tokens,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+        ]
+
+    def _prepare_native_batch(
+        self, batch: dict[str, Any], *, include_action: bool
+    ) -> dict[str, Any]:
         native_batch = dict(self._prepare_vlm_inputs(batch))
 
         if OBS_STATE in batch:
@@ -388,7 +554,9 @@ class XR0Policy(PreTrainedPolicy):
                 self.config.chunk_size,
                 self.config.max_action_dim,
                 device=self.device,
-                dtype=torch.bfloat16 if self.config.dtype == "bfloat16" else torch.float32,
+                dtype=torch.bfloat16
+                if self.config.dtype == "bfloat16"
+                else torch.float32,
             )
             native_batch["action_mask"] = self._make_action_mask(
                 batch_size,
@@ -444,7 +612,9 @@ class XR0Policy(PreTrainedPolicy):
         if prev_chunk_left_over is None or execution_horizon <= 0:
             return 0
 
-        prefix = prev_chunk_left_over.to(device=self.device, dtype=native_batch["action"].dtype)
+        prefix = prev_chunk_left_over.to(
+            device=self.device, dtype=native_batch["action"].dtype
+        )
         if prefix.ndim == 2:
             prefix = prefix.unsqueeze(0)
         if prefix.ndim != 3:
@@ -508,10 +678,14 @@ class XR0Policy(PreTrainedPolicy):
         else:
             if state.ndim == 2:
                 state = state.unsqueeze(1)
-            fallback = state.to(device=action.device, dtype=action.dtype).expand(-1, action.shape[1], -1)
+            fallback = state.to(device=action.device, dtype=action.dtype).expand(
+                -1, action.shape[1], -1
+            )
         return torch.where(control_mask, action, fallback)
 
-    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+    def forward(
+        self, batch: dict[str, Tensor], reduction: str = "mean"
+    ) -> tuple[Tensor, dict]:
         native_batch = self._prepare_native_batch(batch, include_action=True)
         loss_dict = self.model(native_batch, return_loss=True)
         loss = loss_dict["loss"]
@@ -524,7 +698,9 @@ class XR0Policy(PreTrainedPolicy):
             return per_sample, {"loss": float(loss.detach().cpu())}
 
         output_dict = {
-            key: float(value.detach().cpu()) if isinstance(value, Tensor) and value.numel() == 1 else value
+            key: float(value.detach().cpu())
+            if isinstance(value, Tensor) and value.numel() == 1
+            else value
             for key, value in loss_dict.items()
         }
         return loss, output_dict

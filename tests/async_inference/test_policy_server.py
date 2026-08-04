@@ -43,7 +43,9 @@ class MockPolicy:
             """Empty image features since this test doesn't use images."""
             return {}
 
-    def predict_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+    def predict_action_chunk(
+        self, observation: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
         """Return a chunk of 20 dummy actions."""
         batch_size = len(observation[OBS_STATE])
         return torch.zeros(batch_size, 20, 6)
@@ -206,17 +208,70 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     def _fake_get_action_chunk(_self, _obs, _type="act"):
         return torch.zeros(batch_size, actions_per_chunk, action_dim)
 
-    monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+    monkeypatch.setattr(
+        PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True
+    )
 
     obs = _make_obs(torch.zeros(6), timestep=5)
     timed_actions = policy_server._predict_action_chunk(obs)
 
     assert len(timed_actions) == actions_per_chunk
-    assert [ta.get_timestep() for ta in timed_actions] == list(range(5, 5 + actions_per_chunk))
+    assert [ta.get_timestep() for ta in timed_actions] == list(
+        range(5, 5 + actions_per_chunk)
+    )
 
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_predict_action_chunk_does_not_capture_rng_when_debug_is_disabled(
+    monkeypatch, policy_server
+):
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    policy_server.policy_type = "act"
+    policy_server.preprocessor = lambda observation: observation
+    policy_server.postprocessor = lambda action: action
+
+    def fail_if_called(_self):
+        raise AssertionError(
+            "RNG state should not be captured when diagnostics are disabled"
+        )
+
+    class FailIfLocked:
+        def __enter__(self):
+            raise AssertionError(
+                "Policy lock should not be used when diagnostics are disabled"
+            )
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setattr(
+        PolicyServer, "_capture_policy_rng_state", fail_if_called, raising=True
+    )
+    monkeypatch.setattr(
+        policy_server,
+        "_update_tactile_baselines",
+        lambda observation: pytest.fail(
+            "Tactile baselines should not update when diagnostics are disabled"
+        ),
+    )
+    monkeypatch.setattr(
+        policy_server,
+        "_maybe_schedule_xr0_diagnostics",
+        lambda **kwargs: pytest.fail(
+            "Diagnostics should not be scheduled when diagnostics are disabled"
+        ),
+    )
+    policy_server._policy_inference_lock = FailIfLocked()
+
+    timed_actions = policy_server._predict_action_chunk(
+        _make_obs(torch.zeros(6), timestep=5)
+    )
+
+    assert len(timed_actions) == policy_server.actions_per_chunk
 
 
 def test_get_action_chunk_forwards_rtc_metadata(policy_server):
@@ -243,3 +298,105 @@ def test_get_action_chunk_forwards_rtc_metadata(policy_server):
     assert torch.equal(captured_kwargs["prev_chunk_left_over"], prefix)
     assert captured_kwargs["inference_delay"] == 2
     assert captured_kwargs["execution_horizon"] == 5
+
+
+def test_policy_server_debug_options_default_to_disabled():
+    from lerobot.async_inference.configs import PolicyServerConfig
+
+    config = PolicyServerConfig()
+
+    assert config.debug_qwen_text is False
+    assert config.debug_tactile_counterfactual is False
+
+
+def test_tactile_baseline_uses_initial_unloaded_frames(policy_server):
+    policy_server.config.debug_qwen_text = True
+    policy_server.config.debug_tactile_baseline_frames = 3
+    policy_server._debug_qwen_text_enabled = True
+    tactile_key = "observation.images.right_tactile"
+    policy_server._tactile_image_keys = (tactile_key,)
+    policy_server._reset_diagnostic_state()
+
+    for value in (1.0, 3.0, 2.0):
+        policy_server._update_tactile_baselines(
+            {
+                OBS_STATE: torch.zeros(1, 6),
+                tactile_key: torch.full((1, 3, 2, 2), value),
+            }
+        )
+
+    baseline = policy_server._tactile_baselines[tactile_key]
+    assert torch.equal(baseline, torch.full((1, 3, 2, 2), 2.0))
+
+
+def test_tactile_counterfactual_metrics_support_xr0_32d_layout(policy_server):
+    primary = torch.zeros(30, 32)
+    counterfactual = primary.clone()
+    counterfactual[:, 6] = 2.0
+    counterfactual[:, 20] = 4.0
+    counterfactual[:, 7:13] = 1.0
+    counterfactual[:, 21:27] = 3.0
+
+    metrics = policy_server._action_difference_metrics(primary, counterfactual)
+
+    assert metrics["left_gripper_delta"] == pytest.approx(2.0)
+    assert metrics["right_gripper_delta"] == pytest.approx(4.0)
+    assert metrics["left_arm_joint_delta"] == pytest.approx(1.0)
+    assert metrics["right_arm_joint_delta"] == pytest.approx(3.0)
+
+
+def test_tactile_counterfactual_reuses_primary_rng_state(monkeypatch, policy_server):
+    tactile_key = "observation.images.right_tactile"
+    observation = {
+        OBS_STATE: torch.zeros(1, 6),
+        tactile_key: torch.ones(1, 3, 2, 2),
+    }
+    policy_server._tactile_image_keys = (tactile_key,)
+    policy_server._tactile_baselines = {
+        tactile_key: torch.zeros(1, 3, 2, 2),
+    }
+
+    class StochasticTactilePolicy:
+        @staticmethod
+        def predict_action_chunk(observation, **kwargs):
+            tactile_offset = observation[tactile_key].mean()
+            return torch.rand(1, 20, 6) + tactile_offset
+
+    policy = StochasticTactilePolicy()
+    primary_rng_state = policy_server._capture_policy_rng_state()
+    primary_action = policy.predict_action_chunk(observation)
+    rng_state_before_diagnostic = torch.random.get_rng_state().clone()
+    captured = {}
+
+    def capture_metrics(primary, counterfactual):
+        captured["primary"] = primary
+        captured["counterfactual"] = counterfactual
+        return {"mean_abs_delta": float((primary - counterfactual).abs().mean())}
+
+    monkeypatch.setattr(policy_server, "_action_difference_metrics", capture_metrics)
+
+    policy_server._run_xr0_diagnostics(
+        policy=policy,
+        observation=observation,
+        predict_kwargs={},
+        primary_action=primary_action,
+        primary_rng_state=primary_rng_state,
+        timestep=0,
+        run_text=False,
+        run_counterfactual=True,
+    )
+
+    assert torch.allclose(
+        captured["primary"] - captured["counterfactual"],
+        torch.ones_like(primary_action),
+    )
+    assert torch.equal(torch.random.get_rng_state(), rng_state_before_diagnostic)
+
+
+def test_tactile_masking_is_skipped_for_rgb_only_checkpoint(policy_server):
+    policy_server._tactile_image_keys = ()
+    policy_server._tactile_baselines = {}
+
+    observation = {OBS_STATE: torch.zeros(1, 6)}
+
+    assert policy_server._make_tactile_masked_observation(observation) is None

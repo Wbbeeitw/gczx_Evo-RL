@@ -36,7 +36,9 @@ AGGREGATE_FUNCTIONS = {
 }
 
 
-def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+def get_aggregate_function(
+    name: str,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Get aggregate function by name from registry."""
     if name not in AGGREGATE_FUNCTIONS:
         available = list(AGGREGATE_FUNCTIONS.keys())
@@ -53,17 +55,55 @@ class PolicyServerConfig:
     """
 
     # Networking configuration
-    host: str = field(default="localhost", metadata={"help": "Host address to bind the server to"})
-    port: int = field(default=8080, metadata={"help": "Port number to bind the server to"})
+    host: str = field(
+        default="localhost", metadata={"help": "Host address to bind the server to"}
+    )
+    port: int = field(
+        default=8080, metadata={"help": "Port number to bind the server to"}
+    )
 
     # Timing configuration
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
     inference_latency: float = field(
-        default=DEFAULT_INFERENCE_LATENCY, metadata={"help": "Target inference latency in seconds"}
+        default=DEFAULT_INFERENCE_LATENCY,
+        metadata={"help": "Target inference latency in seconds"},
     )
 
     obs_queue_timeout: float = field(
-        default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
+        default=DEFAULT_OBS_QUEUE_TIMEOUT,
+        metadata={"help": "Timeout for observation queue in seconds"},
+    )
+
+    # Optional XR0 diagnostics. Disabled by default for checkpoint and runtime compatibility.
+    debug_qwen_text: bool = field(
+        default=False,
+        metadata={
+            "help": "Periodically decode XR0 Qwen contact-state text on the server"
+        },
+    )
+    debug_qwen_text_interval_s: float = field(
+        default=2.0,
+        metadata={"help": "Minimum seconds between XR0 Qwen text diagnostics"},
+    )
+    debug_qwen_text_max_new_tokens: int = field(
+        default=24,
+        metadata={"help": "Maximum new tokens generated for each XR0 diagnostic text"},
+    )
+    debug_tactile_counterfactual: bool = field(
+        default=False,
+        metadata={
+            "help": "Compare XR0 actions with tactile images replaced by unloaded baselines"
+        },
+    )
+    debug_tactile_action_interval_s: float = field(
+        default=2.0,
+        metadata={"help": "Minimum seconds between XR0 tactile action comparisons"},
+    )
+    debug_tactile_baseline_frames: int = field(
+        default=10,
+        metadata={
+            "help": "Initial unloaded observations used to build each tactile baseline"
+        },
     )
 
     def __post_init__(self):
@@ -72,13 +112,31 @@ class PolicyServerConfig:
             raise ValueError(f"Port must be between 1 and 65535, got {self.port}")
 
         if self.environment_dt <= 0:
-            raise ValueError(f"environment_dt must be positive, got {self.environment_dt}")
+            raise ValueError(
+                f"environment_dt must be positive, got {self.environment_dt}"
+            )
 
         if self.inference_latency < 0:
-            raise ValueError(f"inference_latency must be non-negative, got {self.inference_latency}")
+            raise ValueError(
+                f"inference_latency must be non-negative, got {self.inference_latency}"
+            )
 
         if self.obs_queue_timeout < 0:
-            raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+            raise ValueError(
+                f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}"
+            )
+
+        if self.debug_qwen_text_interval_s <= 0:
+            raise ValueError("debug_qwen_text_interval_s must be positive")
+
+        if self.debug_qwen_text_max_new_tokens <= 0:
+            raise ValueError("debug_qwen_text_max_new_tokens must be positive")
+
+        if self.debug_tactile_action_interval_s <= 0:
+            raise ValueError("debug_tactile_action_interval_s must be positive")
+
+        if self.debug_tactile_baseline_frames <= 0:
+            raise ValueError("debug_tactile_baseline_frames must be positive")
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -98,6 +156,12 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "debug_qwen_text": self.debug_qwen_text,
+            "debug_qwen_text_interval_s": self.debug_qwen_text_interval_s,
+            "debug_qwen_text_max_new_tokens": self.debug_qwen_text_max_new_tokens,
+            "debug_tactile_counterfactual": self.debug_tactile_counterfactual,
+            "debug_tactile_action_interval_s": self.debug_tactile_action_interval_s,
+            "debug_tactile_baseline_frames": self.debug_tactile_baseline_frames,
         }
 
 
@@ -111,7 +175,9 @@ class RobotClientConfig:
 
     # Policy configuration
     policy_type: str = field(metadata={"help": "Type of policy to use"})
-    pretrained_name_or_path: str = field(metadata={"help": "Pretrained model name or path"})
+    pretrained_name_or_path: str = field(
+        metadata={"help": "Pretrained model name or path"}
+    )
 
     # Robot configuration (for CLI usage - robot instance will be created from this)
     robot: RobotConfig = field(metadata={"help": "Robot configuration"})
@@ -121,13 +187,19 @@ class RobotClientConfig:
     actions_per_chunk: int = field(metadata={"help": "Number of actions per chunk"})
 
     # Task instruction for the robot to execute (e.g., 'fold my tshirt')
-    task: str = field(default="", metadata={"help": "Task instruction for the robot to execute"})
+    task: str = field(
+        default="", metadata={"help": "Task instruction for the robot to execute"}
+    )
 
     # Network configuration
-    server_address: str = field(default="localhost:8080", metadata={"help": "Server address to connect to"})
+    server_address: str = field(
+        default="localhost:8080", metadata={"help": "Server address to connect to"}
+    )
 
     # Device configuration
-    policy_device: str = field(default="cpu", metadata={"help": "Device for policy inference"})
+    policy_device: str = field(
+        default="cpu", metadata={"help": "Device for policy inference"}
+    )
     client_device: str = field(
         default="cpu",
         metadata={
@@ -136,11 +208,15 @@ class RobotClientConfig:
     )
 
     # Control behavior configuration
-    chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
+    chunk_size_threshold: float = field(
+        default=0.5, metadata={"help": "Threshold for chunk size control"}
+    )
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
     controlled_arms: str = field(
         default="both",
-        metadata={"help": "Robot arms allowed to receive actions: both, left, or right"},
+        metadata={
+            "help": "Robot arms allowed to receive actions: both, left, or right"
+        },
     )
     startup_right_gripper_position: float | None = field(
         default=None,
@@ -158,17 +234,23 @@ class RobotClientConfig:
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
         default="weighted_average",
-        metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
+        metadata={
+            "help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"
+        },
     )
 
     rtc: RTCConfig = field(default_factory=RTCConfig)
     dry_run_actions: bool = field(
         default=False,
-        metadata={"help": "Advance the action queue without sending commands to the robot"},
+        metadata={
+            "help": "Advance the action queue without sending commands to the robot"
+        },
     )
     duration: float = field(
         default=0.0,
-        metadata={"help": "Optional client runtime in seconds; zero runs until interrupted"},
+        metadata={
+            "help": "Optional client runtime in seconds; zero runs until interrupted"
+        },
     )
     observation_image_codec: str = field(
         default="raw",
@@ -180,7 +262,9 @@ class RobotClientConfig:
     )
     display_data: bool = field(
         default=False,
-        metadata={"help": "Display live robot observations and executed actions in Rerun"},
+        metadata={
+            "help": "Display live robot observations and executed actions in Rerun"
+        },
     )
     display_compressed_images: bool = field(
         default=True,
@@ -215,13 +299,17 @@ class RobotClientConfig:
             raise ValueError("client_device cannot be empty")
 
         if self.chunk_size_threshold < 0 or self.chunk_size_threshold > 1:
-            raise ValueError(f"chunk_size_threshold must be between 0 and 1, got {self.chunk_size_threshold}")
+            raise ValueError(
+                f"chunk_size_threshold must be between 0 and 1, got {self.chunk_size_threshold}"
+            )
 
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
 
         if self.actions_per_chunk <= 0:
-            raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
+            raise ValueError(
+                f"actions_per_chunk must be positive, got {self.actions_per_chunk}"
+            )
 
         if self.controlled_arms not in {"both", "left", "right"}:
             raise ValueError(
@@ -239,8 +327,13 @@ class RobotClientConfig:
         if self.startup_right_gripper_hold_s < 0 or not math.isfinite(
             self.startup_right_gripper_hold_s
         ):
-            raise ValueError("startup_right_gripper_hold_s must be finite and non-negative")
-        if self.startup_right_gripper_hold_s > 0 and self.startup_right_gripper_position is None:
+            raise ValueError(
+                "startup_right_gripper_hold_s must be finite and non-negative"
+            )
+        if (
+            self.startup_right_gripper_hold_s > 0
+            and self.startup_right_gripper_position is None
+        ):
             raise ValueError(
                 "startup_right_gripper_hold_s requires startup_right_gripper_position"
             )
