@@ -99,6 +99,19 @@ PYTHONUNBUFFERED=1 python -m lerobot.async_inference.robot_client \
 时间设为正数时，才会在正式动作开始后的指定时间内覆盖 `right_gripper.pos`；右臂
 六个关节始终执行策略输出。不传这两个参数时保持原有行为。
 
+双臂推理可以同时设置启动夹爪位置：
+
+```bash
+--startup_left_gripper_position=100.0 \
+--startup_left_gripper_hold_s=0.0 \
+--startup_right_gripper_position=100.0 \
+--startup_right_gripper_hold_s=0.0
+```
+
+两个启动位置会在客户端连接机器人后作为一次联合动作发送；保持时间大于零时，
+对应夹爪会在正式策略动作开始后暂时保持该位置。启动位置必须使用各自标定后的
+机器人 action 坐标。
+
 checkpoint 路径由 GPU server 读取，因此 client 命令中的路径必须是 GPU 服务器上的路径。
 
 dry-run 期间重点检查：

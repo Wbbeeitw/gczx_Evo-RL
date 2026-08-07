@@ -550,6 +550,29 @@ def test_robot_client_config_exposes_startup_right_gripper_settings():
     assert config_dict["startup_right_gripper_hold_s"] == 1.5
 
 
+def test_robot_client_config_exposes_both_startup_gripper_settings():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        controlled_arms="both",
+        startup_left_gripper_position=100.0,
+        startup_left_gripper_hold_s=1.0,
+        startup_right_gripper_position=101.0,
+        startup_right_gripper_hold_s=1.5,
+    )
+
+    config_dict = config.to_dict()
+    assert config_dict["startup_left_gripper_position"] == 100.0
+    assert config_dict["startup_left_gripper_hold_s"] == 1.0
+    assert config_dict["startup_right_gripper_position"] == 101.0
+    assert config_dict["startup_right_gripper_hold_s"] == 1.5
+
+
 @pytest.mark.parametrize(
     "position, hold_s, controlled_arms, expected_message",
     [
@@ -574,6 +597,33 @@ def test_robot_client_config_rejects_invalid_startup_right_gripper_settings(
             controlled_arms=controlled_arms,
             startup_right_gripper_position=position,
             startup_right_gripper_hold_s=hold_s,
+        )
+
+
+@pytest.mark.parametrize(
+    "position, hold_s, controlled_arms, expected_message",
+    [
+        (float("nan"), 0.0, "both", "must be finite"),
+        (0.0, -1.0, "both", "finite and non-negative"),
+        (None, 1.0, "both", "requires startup_left_gripper_position"),
+        (0.0, 0.0, "right", "controlled_arms='right'"),
+    ],
+)
+def test_robot_client_config_rejects_invalid_startup_left_gripper_settings(
+    position, hold_s, controlled_arms, expected_message
+):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match=expected_message):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            controlled_arms=controlled_arms,
+            startup_left_gripper_position=position,
+            startup_left_gripper_hold_s=hold_s,
         )
 
 
@@ -609,6 +659,41 @@ def test_startup_right_gripper_command_and_hold(monkeypatch, robot_client):
     assert held == {"right_joint.pos": 12.0, "right_gripper.pos": 0.0}
     assert still_held == {"right_joint.pos": 13.0, "right_gripper.pos": 0.0}
     assert released == {"right_joint.pos": 14.0, "right_gripper.pos": -35.0}
+    assert robot_client.startup_right_gripper_hold_finished is True
+
+
+def test_startup_both_gripper_command_and_hold(monkeypatch, robot_client):
+    sent_actions = []
+    robot_client.robot.action_features = {
+        "left_gripper.pos": float,
+        "right_gripper.pos": float,
+    }
+    robot_client.config.startup_left_gripper_position = 100.0
+    robot_client.config.startup_left_gripper_hold_s = 1.0
+    robot_client.config.startup_right_gripper_position = 101.0
+    robot_client.config.startup_right_gripper_hold_s = 1.5
+    monkeypatch.setattr(
+        robot_client.robot,
+        "send_action",
+        lambda action: sent_actions.append(dict(action)) or dict(action),
+    )
+
+    robot_client._command_startup_gripper_positions()
+    held = robot_client._apply_startup_gripper_holds(
+        {"left_gripper.pos": -25.0, "right_gripper.pos": -30.0},
+        now=100.0,
+    )
+    released = robot_client._apply_startup_gripper_holds(
+        {"left_gripper.pos": -35.0, "right_gripper.pos": -40.0},
+        now=101.5,
+    )
+
+    assert sent_actions == [
+        {"left_gripper.pos": 100.0, "right_gripper.pos": 101.0}
+    ]
+    assert held == {"left_gripper.pos": 100.0, "right_gripper.pos": 101.0}
+    assert released == {"left_gripper.pos": -35.0, "right_gripper.pos": -40.0}
+    assert robot_client.startup_left_gripper_hold_finished is True
     assert robot_client.startup_right_gripper_hold_finished is True
 
 

@@ -266,6 +266,18 @@ class RobotClientConfig:
             "help": "Robot arms allowed to receive actions: both, left, or right"
         },
     )
+    startup_left_gripper_position: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional left gripper position commanded once after the robot connects"
+        },
+    )
+    startup_left_gripper_hold_s: float = field(
+        default=0.0,
+        metadata={
+            "help": "Seconds to hold startup_left_gripper_position after policy execution begins"
+        },
+    )
     startup_right_gripper_position: float | None = field(
         default=None,
         metadata={
@@ -365,26 +377,38 @@ class RobotClientConfig:
                 f"got {self.controlled_arms}"
             )
 
-        if self.startup_right_gripper_position is not None:
-            if not math.isfinite(self.startup_right_gripper_position):
-                raise ValueError("startup_right_gripper_position must be finite")
-            if self.controlled_arms == "left":
+        startup_gripper_settings = (
+            (
+                "left",
+                self.startup_left_gripper_position,
+                self.startup_left_gripper_hold_s,
+            ),
+            (
+                "right",
+                self.startup_right_gripper_position,
+                self.startup_right_gripper_hold_s,
+            ),
+        )
+        for side, position, hold_s in startup_gripper_settings:
+            if position is not None and not math.isfinite(position):
+                raise ValueError(f"startup_{side}_gripper_position must be finite")
+            if (side == "left" and self.controlled_arms == "right") or (
+                side == "right" and self.controlled_arms == "left"
+            ):
+                if position is not None:
+                    raise ValueError(
+                        f"startup_{side}_gripper_position cannot be used when "
+                        f"controlled_arms='{self.controlled_arms}'"
+                    )
+            if hold_s < 0 or not math.isfinite(hold_s):
                 raise ValueError(
-                    "startup_right_gripper_position cannot be used when controlled_arms='left'"
+                    f"startup_{side}_gripper_hold_s must be finite and non-negative"
                 )
-        if self.startup_right_gripper_hold_s < 0 or not math.isfinite(
-            self.startup_right_gripper_hold_s
-        ):
-            raise ValueError(
-                "startup_right_gripper_hold_s must be finite and non-negative"
-            )
-        if (
-            self.startup_right_gripper_hold_s > 0
-            and self.startup_right_gripper_position is None
-        ):
-            raise ValueError(
-                "startup_right_gripper_hold_s requires startup_right_gripper_position"
-            )
+            if hold_s > 0 and position is None:
+                raise ValueError(
+                    f"startup_{side}_gripper_hold_s requires "
+                    f"startup_{side}_gripper_position"
+                )
 
         if self.duration < 0:
             raise ValueError(f"duration must be non-negative, got {self.duration}")
@@ -424,6 +448,8 @@ class RobotClientConfig:
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
+            "startup_left_gripper_position": self.startup_left_gripper_position,
+            "startup_left_gripper_hold_s": self.startup_left_gripper_hold_s,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
             "rtc": self.rtc,

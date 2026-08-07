@@ -129,20 +129,21 @@ class RobotClient:
         self.right_gripper_sent_max = None
         self.right_gripper_feedback_min = None
         self.right_gripper_feedback_max = None
+        self.startup_left_gripper_hold_started_at = None
+        self.startup_left_gripper_hold_finished = False
         self.startup_right_gripper_hold_started_at = None
         self.startup_right_gripper_hold_finished = False
         self.robot = make_robot_from_config(config.robot)
-        if (
-            config.startup_right_gripper_position is not None
-            and "right_gripper.pos" not in self.robot.action_features
-        ):
-            raise ValueError(
-                "startup_right_gripper_position requires robot action feature "
-                "'right_gripper.pos'"
-            )
+        for side in ("left", "right"):
+            position = getattr(config, f"startup_{side}_gripper_position")
+            if position is not None and f"{side}_gripper.pos" not in self.robot.action_features:
+                raise ValueError(
+                    f"startup_{side}_gripper_position requires robot action feature "
+                    f"'{side}_gripper.pos'"
+                )
         self.robot.connect()
         try:
-            self._command_startup_right_gripper_position()
+            self._command_startup_gripper_positions()
         except BaseException:
             self.robot.disconnect()
             raise
@@ -643,51 +644,89 @@ class RobotClient:
             action = {key: value for key, value in action.items() if not key.startswith("right_")}
         return action
 
-    def _command_startup_right_gripper_position(self) -> None:
-        position = self.config.startup_right_gripper_position
-        if position is None:
+    def _command_startup_gripper_positions(self) -> None:
+        startup_action = {
+            f"{side}_gripper.pos": float(getattr(self.config, f"startup_{side}_gripper_position"))
+            for side in ("left", "right")
+            if getattr(self.config, f"startup_{side}_gripper_position") is not None
+        }
+        if not startup_action:
             return
 
-        action = {"right_gripper.pos": float(position)}
-        sent_action = action if self.config.dry_run_actions else self.robot.send_action(action)
-        self._remember_gripper_action(action, sent_action)
-        self._remember_display_action(sent_action)
-        sent_position = None if sent_action is None else sent_action.get("right_gripper.pos")
-        self.logger.info(
-            "Startup right gripper position commanded target=%.2f sent=%.2f dry_run=%s hold_s=%.2f",
-            position,
-            float("nan") if sent_position is None else sent_position,
-            self.config.dry_run_actions,
-            self.config.startup_right_gripper_hold_s,
+        sent_action = (
+            startup_action
+            if self.config.dry_run_actions
+            else self.robot.send_action(startup_action)
         )
+        self._remember_display_action(sent_action)
+        for side in ("left", "right"):
+            key = f"{side}_gripper.pos"
+            if key not in startup_action:
+                continue
+            if side == "right":
+                self._remember_gripper_action(
+                    {key: startup_action[key]},
+                    None if sent_action is None else {key: sent_action.get(key)},
+                )
+            sent_position = None if sent_action is None else sent_action.get(key)
+            self.logger.info(
+                "Startup %s gripper position commanded target=%.2f sent=%.2f dry_run=%s hold_s=%.2f",
+                side,
+                startup_action[key],
+                float("nan") if sent_position is None else sent_position,
+                self.config.dry_run_actions,
+                getattr(self.config, f"startup_{side}_gripper_hold_s"),
+            )
+
+    def _command_startup_right_gripper_position(self) -> None:
+        """Backward-compatible wrapper for callers using the old helper name."""
+        self._command_startup_gripper_positions()
+
+    def _apply_startup_gripper_holds(
+        self,
+        action: dict[str, float],
+        now: float | None = None,
+    ) -> dict[str, float]:
+        now = time.perf_counter() if now is None else now
+        held_action = dict(action)
+        for side in ("left", "right"):
+            position = getattr(self.config, f"startup_{side}_gripper_position")
+            hold_s = getattr(self.config, f"startup_{side}_gripper_hold_s")
+            started_at_attr = f"startup_{side}_gripper_hold_started_at"
+            finished_attr = f"startup_{side}_gripper_hold_finished"
+            if position is None or hold_s <= 0 or getattr(self, finished_attr):
+                continue
+
+            started_at = getattr(self, started_at_attr)
+            if started_at is None:
+                setattr(self, started_at_attr, now)
+                self.logger.info(
+                    "Startup %s gripper hold started position=%.2f duration=%.2fs",
+                    side,
+                    position,
+                    hold_s,
+                )
+                started_at = now
+
+            if now - started_at < hold_s:
+                held_action[f"{side}_gripper.pos"] = float(position)
+                continue
+
+            setattr(self, finished_attr, True)
+            self.logger.info(
+                "Startup %s gripper hold complete; policy now controls the gripper",
+                side,
+            )
+
+        return held_action
 
     def _apply_startup_right_gripper_hold(
         self,
         action: dict[str, float],
         now: float | None = None,
     ) -> dict[str, float]:
-        position = self.config.startup_right_gripper_position
-        hold_s = self.config.startup_right_gripper_hold_s
-        if position is None or hold_s <= 0 or self.startup_right_gripper_hold_finished:
-            return action
-
-        now = time.perf_counter() if now is None else now
-        if self.startup_right_gripper_hold_started_at is None:
-            self.startup_right_gripper_hold_started_at = now
-            self.logger.info(
-                "Startup right gripper hold started position=%.2f duration=%.2fs",
-                position,
-                hold_s,
-            )
-
-        if now - self.startup_right_gripper_hold_started_at < hold_s:
-            held_action = dict(action)
-            held_action["right_gripper.pos"] = float(position)
-            return held_action
-
-        self.startup_right_gripper_hold_finished = True
-        self.logger.info("Startup right gripper hold complete; policy now controls the gripper")
-        return action
+        """Backward-compatible wrapper for callers using the old helper name."""
+        return self._apply_startup_gripper_holds(action, now=now)
 
     def _remember_display_action(self, action: dict[str, Any] | None) -> None:
         if action is None:
@@ -826,7 +865,7 @@ class RobotClient:
                 return None
 
             policy_action_dict = self._action_tensor_to_action_dict(action_tensor)
-            action_dict = self._apply_startup_right_gripper_hold(policy_action_dict)
+            action_dict = self._apply_startup_gripper_holds(policy_action_dict)
             send_started_at = time.perf_counter()
             try:
                 performed_action = (
@@ -866,7 +905,7 @@ class RobotClient:
             return None
 
         policy_action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
-        action_dict = self._apply_startup_right_gripper_hold(policy_action_dict)
+        action_dict = self._apply_startup_gripper_holds(policy_action_dict)
         send_started_at = time.perf_counter()
         performed_action = (
             action_dict if self.config.dry_run_actions else self.robot.send_action(action_dict)
